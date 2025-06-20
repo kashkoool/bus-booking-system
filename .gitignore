@@ -1,1 +1,61 @@
-.qodo
+# Dependencies
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Build files
+build/
+dist/
+.next/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Testing
+coverage/
+
+# Production
+build
+
+# Debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local development
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Misc
+.DS_Store
+*.pem
+
+# User frontend specific
+user-front/node_modules/
+user-front/.next/
+user-front/out/
+
+# Backend specific
+backend/node_modules/
+backend/.env
