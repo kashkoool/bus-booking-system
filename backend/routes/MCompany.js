@@ -1,31 +1,22 @@
 const express = require('express');
 const router = express.Router();
+const mongoose = require('mongoose');
+const { check, validationResult } = require('express-validator');
 const { auth } = require('../middleware/authMiddleware');
 const { managerOnly } = require('../middleware/roleMiddleware');
 const Staff = require('../models/Staff');
+const Notification = require('../models/Notification');
 const Company = require('../models/Company');
 const Bus = require('../models/Bus');
 const Trip = require('../models/Trip');
 const Booking = require('../models/Booking');
-const Notification = require('../models/Notification');
 const Payment = require('../models/Payment');
 const bcrypt = require('bcrypt');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const ExcelJS = require('exceljs');
-
-// Helper function to set Excel headers
-const setExcelHeaders = (res, filename) => {
-  res.setHeader(
-    'Content-Type',
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-  );
-  res.setHeader(
-    'Content-Disposition',
-    `attachment; filename=${filename}_${new Date().toISOString().split('T')[0]}.xlsx`
-  );
-};
+const PDFDocument = require('pdfkit');
+const { tajawalFonts, getSystemLogoBuffer, addPdfHeader, addPdfFooter } = require('../utils/pdfGenerator');
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -59,38 +50,464 @@ const upload = multer({
   }
 }).single('logo');
 
-// Company dashboard
-router.get('/dashboard', auth, managerOnly, async (req, res) => {
+// Bus Management Endpoints
+
+// Get all buses for company
+router.get('/buses', auth, managerOnly, async (req, res) => {
+  try {
+    const companyId = req.user.companyID || req.user._id;
+    const buses = await Bus.find({ company: companyId })
+      .populate('driver', 'username fullName phone')
+      .select('-__v');
+    
+    res.json(buses);
+  } catch (error) {
+    console.error('Error fetching buses:', error);
+    res.status(500).json({ message: 'فشل في تحميل بيانات الباصات', error: error.message });
+  }
+});
+
+// Add a new bus
+router.post('/add-bus', auth, managerOnly, [
+  check('busNumber', 'رقم الباص مطلوب').notEmpty(),
+  check('seats', 'سعة الباص مطلوبة').isNumeric()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const companyId = req.user.companyID || req.user._id;
+    const { busNumber, seats, busType, model, driver } = req.body;
+
+    // Check if bus number already exists for this company
+    const existingBus = await Bus.findOne({ busNumber, company: companyId });
+    if (existingBus) {
+      return res.status(400).json({ message: 'رقم الباص مسجل مسبقاً' });
+    }
+
+    // Prevent assigning the same driver to more than one bus
+    if (driver) {
+      const driverAssigned = await Bus.findOne({ driver });
+      if (driverAssigned) {
+        return res.status(400).json({ message: 'هذا السائق مرتبط بالفعل بباص آخر' });
+      }
+    }
+
+    const newBus = new Bus({
+      companyID: companyId,
+      company: companyId,
+      addedBy: req.user._id,
+      busNumber,
+      seats: Number(seats),
+      busType,
+      model,
+      driver: driver || null,
+      // status: 'active' // Default status
+    });
+
+    await newBus.save();
+    res.status(201).json({ message: 'تمت إضافة باص بنجاح', bus: newBus });
+  } catch (error) {
+    console.error('Error adding bus:', error);
+    res.status(500).json({ message: 'فشل في إضافة الباص', error: error.message });
+  }
+});
+
+// Toggle bus active status
+router.patch('/buses/:id/toggle-status', auth, managerOnly, async (req, res) => {
+  try {
+    const bus = await Bus.findById(req.params.id);
+    if (!bus) {
+      return res.status(404).json({ message: 'الباص غير موجود' });
+    }
+
+    // Verify bus belongs to company
+    const companyId = req.user.companyID || req.user._id;
+    if (bus.company.toString() !== companyId.toString()) {
+      return res.status(403).json({ message: 'غير مصرح' });
+    }
+
+    bus.isActive = !bus.isActive;
+    await bus.save();
+
+    res.json({ 
+      message: `تم ${bus.isActive ? 'تفعيل' : 'تعطيل'} الباص بنجاح`,
+      isActive: bus.isActive 
+    });
+  } catch (error) {
+    console.error('Error toggling bus status:', error);
+    res.status(500).json({ message: 'فشل في تغيير حالة الباص', error: error.message });
+  }
+});
+
+// Delete a bus
+router.delete('/buses/:id', auth, managerOnly, async (req, res) => {
+  try {
+    const bus = await Bus.findById(req.params.id);
+    if (!bus) {
+      return res.status(404).json({ message: 'الباص غير موجود' });
+    }
+
+    // Verify bus belongs to company
+    const companyId = req.user.companyID || req.user._id;
+    if (bus.company.toString() !== companyId.toString()) {
+      return res.status(403).json({ message: 'غير مصرح' });
+    }
+
+    // Check if bus is assigned to any trips
+    const hasTrips = await Trip.exists({ bus: bus._id });
+    if (hasTrips) {
+      return res.status(400).json({ 
+        message: 'لا يمكن حذف الباص لأنه مرتبط برحلات',
+        hasTrips: true
+      });
+    }
+
+    await Bus.findByIdAndDelete(req.params.id);
+    res.json({ message: 'تم حذف الباص بنجاح' });
+  } catch (error) {
+    console.error('Error deleting bus:', error);
+    res.status(500).json({ message: 'فشل في حذف الباص', error: error.message });
+  }
+});
+
+// Get single bus details
+router.get('/buses/:id', auth, managerOnly, async (req, res) => {
+  try {
+    const bus = await Bus.findById(req.params.id)
+      .populate('driver', 'username fullName phone')
+      .select('-__v');
+    
+    if (!bus) {
+      return res.status(404).json({ message: 'الباص غير موجود' });
+    }
+
+    // Verify bus belongs to company
+    const companyId = req.user.companyID || req.user._id;
+    if (bus.company.toString() !== companyId.toString()) {
+      return res.status(403).json({ message: 'غير مصرح' });
+    }
+
+    res.json(bus);
+  } catch (error) {
+    console.error('Error fetching bus:', error);
+    res.status(500).json({ message: 'فشل في تحميل بيانات الباص', error: error.message });
+  }
+});
+
+// Update bus details
+router.put('/buses/:id', auth, managerOnly, async (req, res) => {
+  try {
+    const { busNumber, busType, driver } = req.body;
+    
+    const bus = await Bus.findById(req.params.id);
+    if (!bus) {
+      return res.status(404).json({ message: 'الباص غير موجود' });
+    }
+
+    // Verify bus belongs to company
+    const companyId = req.user.companyID || req.user._id;
+    if (bus.company.toString() !== companyId.toString()) {
+      return res.status(403).json({ message: 'غير مصرح' });
+    }
+
+    // Check if bus number is being updated and if it's already taken
+    if (busNumber && busNumber !== bus.busNumber) {
+      const existingBus = await Bus.findOne({ 
+        busNumber,
+        company: companyId,
+        _id: { $ne: req.params.id }
+      });
+      
+      if (existingBus) {
+        return res.status(400).json({ message: 'رقم الباص مسجل مسبقاً' });
+      }
+      bus.busNumber = busNumber;
+    }
+
+    // Update other fields
+    if (busType) bus.busType = busType;
+    
+    // Handle driver assignment
+    if (driver !== undefined) {
+      // If driver is being unassigned
+      if (driver === '' || driver === null) {
+        bus.driver = null;
+      } else {
+        // Verify driver exists and belongs to company
+        const driverStaff = await Staff.findOne({
+          _id: driver,
+          companyID: companyId,
+          staffType: 'driver'
+        });
+        
+        if (!driverStaff) {
+          return res.status(400).json({ message: 'السائق غير صالح' });
+        }
+        
+        bus.driver = driver;
+      }
+    }
+
+    await bus.save();
+    
+    // Populate driver details in response
+    const updatedBus = await Bus.findById(req.params.id)
+      .populate('driver', 'username phone')
+      .select('-__v');
+    
+    res.json({ 
+      message: 'تم تحديث بيانات الباص بنجاح',
+      bus: updatedBus 
+    });
+  } catch (error) {
+    console.error('Error updating bus:', error);
+    res.status(500).json({ message: 'فشل في تحديث بيانات الباص', error: error.message });
+  }
+});
+
+// Get all staff for company with search, filter, and pagination
+router.get('/staff', auth, managerOnly, async (req, res) => {
+  try {
+    const companyId = req.user.companyID || req.user._id;
+    const { 
+      page = 1, 
+      limit = 10, 
+      search = '',
+      status,
+      staffType,
+      sortBy = 'createdAt',
+      sortOrder = 'desc'
+    } = req.query;
+
+    // Build query
+    const query = { companyID: companyId };
+    
+    // Add search criteria
+    if (search) {
+      query.$or = [
+        { username: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+        { phone: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    // Add status filter
+    if (status) {
+      query.status = status;
+    }
+
+    // Add staff type filter
+    if (staffType) {
+      query.staffType = staffType;
+    }
+
+    // Set up pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const count = await Staff.countDocuments(query);
+    
+    // Find staff with pagination and sorting
+    const staff = await Staff.find(query)
+      .select('-password -__v -updatedAt') // Removed -createdAt to include it in the response
+      .sort({ [sortBy]: sortOrder === 'desc' ? -1 : 1 })
+      .skip(skip)
+      .limit(parseInt(limit))
+      .lean();
+
+    res.status(200).json({
+      success: true,
+      data: staff,
+      pagination: {
+        total: count,
+        page: parseInt(page),
+        pages: Math.ceil(count / limit),
+        limit: parseInt(limit)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching staff:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching staff',
+      error: error.message
+    });
+  }
+});
+
+// Get individual staff member by ID
+router.get('/staff/:id/view', auth, managerOnly, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const companyId = req.user.companyID || req.user._id;
+
+    // Find staff member
+    const staff = await Staff.findOne({ 
+      _id: id, 
+      companyID: companyId 
+    }).select('-password -__v');
+
+    if (!staff) {
+      return res.status(404).json({ 
+        success: false,
+        message: 'Staff member not found' 
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: staff
+    });
+  } catch (error) {
+    console.error('Error fetching staff member:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching staff member',
+      error: error.message
+    });
+  }
+});
+
+// Get company notifications
+router.get('/notifications', auth, managerOnly, async (req, res) => {
   try {
     const companyId = req.user.companyID || req.user._id;
     
-    // Get basic company info
-    const company = await Company.findOne({ 
-      $or: [
-        { companyID: companyId },
-        { _id: companyId }
-      ]
-    }).select('-password');
+    // Find notifications for this company
+    const notifications = await Notification.find({
+      companyID: companyId,
+      isRead: false
+    })
+    .sort({ createdAt: -1 })
+    .limit(10);
 
-    if (!company) {
-      return res.status(404).json({
+    res.status(200).json({
+      success: true,
+      notifications
+    });
+  } catch (error) {
+    console.error('Error fetching notifications:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching notifications',
+      error: error.message
+    });
+  }
+});
+
+// Company dashboard
+router.get('/dashboard', auth, managerOnly, async (req, res) => {
+  console.log('=== Dashboard Request ===');
+  console.log('User:', {
+    _id: req.user?._id,
+    companyID: req.user?.companyID,
+    role: req.user?.role
+  });
+
+  try {
+    if (!req.user) {
+      console.error('No user in request');
+      return res.status(401).json({
         success: false,
-        message: 'Company not found'
+        message: 'User not authenticated'
       });
     }
+
+    const companyId = req.user.companyID || req.user._id;
+    console.log('Looking up company with ID:', companyId, 'Type:', typeof companyId);
+    
+    // Build query to handle both numeric companyID and ObjectId _id
+    const query = {};
+    
+    // If companyId is a number, search by companyID field only
+    if (typeof companyId === 'number' || !isNaN(companyId)) {
+      query.companyID = companyId;
+    } else if (typeof companyId === 'string' && companyId.length === 24) {
+      // If it's a string that looks like an ObjectId, try to use it as _id
+      query.$or = [
+        { _id: companyId },
+        { companyID: companyId }
+      ];
+    } else {
+      // For other cases, try both
+      query.$or = [
+        { _id: companyId },
+        { companyID: companyId },
+        { companyID: companyId?.toString?.() }
+      ].filter(Boolean);
+    }
+
+    console.log('Query:', JSON.stringify(query, null, 2));
+    
+    // Get basic company info
+    const company = await Company.findOne(query).select('-password').lean();
+
+    console.log('Found company:', company ? 'Yes' : 'No');
+
+    if (!company) {
+      console.error('Company not found for ID:', companyId);
+      return res.status(404).json({
+        success: false,
+        message: 'Company not found',
+        companyId: companyId
+      });
+    }
+
+    // Get additional stats
+    const [staffCount, busCount, activeTrips, todayBookings] = await Promise.all([
+      Staff.countDocuments({ companyID: companyId }),
+      Bus.countDocuments({ companyID: companyId }),
+      Trip.countDocuments({ companyID: companyId, status: 'active' }),
+      Booking.countDocuments({ 
+        companyID: companyId,
+        createdAt: { $gte: new Date().setHours(0,0,0,0) }
+      })
+    ]);
+
+    console.log('Stats loaded:', { staffCount, busCount, activeTrips, todayBookings });
 
     res.json({
       success: true,
       message: 'Company Dashboard',
-      user: req.user,
-      company: company
+      user: {
+        id: req.user._id,
+        name: req.user.name,
+        email: req.user.email,
+        role: req.user.role
+      },
+      company: company,
+      stats: {
+        staff: staffCount,
+        buses: busCount,
+        activeTrips,
+        todayBookings,
+        totalUsers: staffCount + 1 // +1 for the manager
+      },
+      revenueData: {
+        labels: ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو'],
+        data: [12000, 19000, 3000, 5000, 2000, 25000]
+      },
+      userDistribution: {
+        customers: 60,
+        staff: 30,
+        companyManagers: 5,
+        admins: 5
+      }
     });
   } catch (error) {
-    console.error('Dashboard error:', error);
+    console.error('Dashboard error:', {
+      message: error.message,
+      stack: error.stack,
+      user: req.user,
+      companyId: req.user?.companyID || req.user?._id
+    });
+    
     res.status(500).json({
       success: false,
       message: 'Error loading dashboard',
-      error: error.message
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error',
+      ...(process.env.NODE_ENV === 'development' && { stack: error.stack })
     });
   }
 });
@@ -110,6 +527,12 @@ router.get('/stats', auth, managerOnly, async (req, res) => {
     // Get company's trips
     const trips = await Trip.find({ companyID: companyId });
     const tripIds = trips.map(trip => trip._id);
+
+    // Get bus count for the company
+    const busCount = await Bus.countDocuments({ companyID: companyId });
+
+    // Get staff count for the company
+    const staffCount = await Staff.countDocuments({ companyID: companyId });
 
     // Get total bookings count and revenue
     const bookingsStats = await Booking.aggregate([
@@ -197,7 +620,9 @@ router.get('/stats', auth, managerOnly, async (req, res) => {
         totalRevenue: bookingsStats[0]?.totalRevenue || 0,
         monthlyRevenue: bookingsStats[0]?.monthlyRevenue || 0,
         yearlyRevenue: bookingsStats[0]?.yearlyRevenue || 0,
-        upcomingTrips
+        upcomingTrips,
+        busCount,
+        staffCount
       },
       monthlyData,
       recentBookings: recentBookings.map(booking => ({
@@ -565,61 +990,205 @@ router.get('/show-all-staff', auth, managerOnly, async (req, res) => {
 });
 
 
-// Delete staff
-router.delete('/deletestaff/:id', auth, managerOnly, async (req, res) => {
+// Update staff
+router.put('/updatestaff/:id', [
+  auth, 
+  managerOnly,
+  [
+    check('username', 'Username is required').optional().notEmpty(),
+    check('email', 'Please include a valid email').optional().isEmail(),
+    check('phone', 'Please include a valid phone number').optional().isMobilePhone(),
+    check('staffType', 'Invalid staff type').optional().isIn(['accountant', 'supervisor', 'employee', 'driver']),
+    check('status', 'Invalid status').optional().isIn(['active', 'suspended'])
+  ]
+], async (req, res) => {
   try {
+    // Validate request body
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        errors: errors.array()
+      });
+    }
+
     const { id } = req.params;
+    const updates = req.body;
+    const companyId = req.user.companyID || req.user._id;
 
     // Find staff member
     const staff = await Staff.findById(id);
     if (!staff) {
-      return res.status(404).json({ message: 'Staff not found' });
+      return res.status(404).json({ 
+        success: false,
+        message: 'Staff not found' 
+      });
     }
 
     // Verify staff belongs to manager's company
-    if (staff.companyID !== req.company.companyID) {
-      return res.status(403).json({ message: 'Not authorized to delete this staff member' });
+    if (staff.companyID.toString() !== companyId.toString()) {
+      return res.status(403).json({ 
+        success: false,
+        message: 'Not authorized to update this staff member' 
+      });
     }
 
+    // Update allowed fields
+    const allowedUpdates = [
+      'username', 'age', 'gender', 'phone', 'email', 
+      'address', 'staffType'
+    ];
+    const updatesToApply = {};
+    
+    // Only allow direct updates to specific fields
+    Object.keys(updates).forEach(key => {
+      if (allowedUpdates.includes(key)) {
+        updatesToApply[key] = updates[key];
+      }
+    });
+
+    // Handle status and isActive updates
+    if (updates.status !== undefined) {
+      updatesToApply.status = updates.status;
+      // The model's setter will handle syncing isActive
+    } else if (updates.isActive !== undefined) {
+      // If isActive is provided directly, map it to status
+      updatesToApply.status = updates.isActive ? 'active' : 'inactive';
+    }
+
+    // If email is being updated, check if it's already in use
+    if (updatesToApply.email && updatesToApply.email !== staff.email) {
+      const existingStaff = await Staff.findOne({ email: updatesToApply.email });
+      if (existingStaff) {
+        return res.status(400).json({
+          success: false,
+          message: 'Email is already in use by another staff member'
+        });
+      }
+    }
+
+    // If phone is being updated, check if it's already in use
+    if (updatesToApply.phone && updatesToApply.phone !== staff.phone) {
+      const existingStaff = await Staff.findOne({ phone: updatesToApply.phone });
+      if (existingStaff) {
+        return res.status(400).json({
+          success: false,
+          message: 'Phone number is already in use by another staff member'
+        });
+      }
+    }
+
+    // Update staff
+    const updatedStaff = await Staff.findByIdAndUpdate(
+      id,
+      { $set: updatesToApply },
+      { new: true, runValidators: true }
+    ).select('-password -__v');
+
+    res.status(200).json({
+      success: true,
+      message: 'Staff updated successfully',
+      data: updatedStaff
+    });
+  } catch (error) {
+    console.error('Error updating staff:', error);
+    
+    // Handle duplicate key errors
+    if (error.code === 11000) {
+      const field = Object.keys(error.keyPattern)[0];
+      return res.status(400).json({
+        success: false,
+        message: `${field} is already in use`
+      });
+    }
+    
+    // Handle validation errors
+    if (error.name === 'ValidationError') {
+      const messages = Object.values(error.errors).map(val => val.message);
+      return res.status(400).json({
+        success: false,
+        message: 'Validation error',
+        errors: messages
+      });
+    }
+    
+    res.status(500).json({
+      success: false,
+      message: 'Error updating staff',
+      error: error.message
+    });
+  }
+});
+
+// Delete staff
+router.delete('/deletestaff/:id', auth, managerOnly, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const companyId = req.user.companyID || req.user._id;
+
+    // Find staff member
+    const staff = await Staff.findById(id);
+    if (!staff) {
+      return res.status(404).json({
+        success: false,
+        message: 'Staff not found'
+      });
+    }
+
+    // Verify staff belongs to manager's company
+    if (staff.companyID.toString() !== companyId.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to delete this staff member'
+      });
+    }
+
+    // Check if staff has any active bookings or assignments
+    const hasActiveBookings = await Booking.exists({ 
+      $or: [
+        { 'staffID': id },
+        { 'driverID': id }
+      ],
+      status: { $nin: ['completed', 'cancelled'] }
+    });
+
+    if (hasActiveBookings) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot delete staff with active bookings or assignments',
+        code: 'ACTIVE_BOOKINGS_EXIST'
+      });
+    }
+
+    // Delete the staff member
     await Staff.findByIdAndDelete(id);
     
-    res.json({
+    res.status(200).json({
+      success: true,
       message: 'Staff deleted successfully',
-      staffId: id
+      data: { staffId: id }
     });
   } catch (error) {
-    console.error('Staff deletion error:', error);
-    res.status(500).json({ message: 'Error deleting staff' });
+    console.error('Error deleting staff:', error);
+    
+    if (error.name === 'CastError') {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid staff ID format'
+      });
+    }
+    
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete staff',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
   }
 });
 
 
 
-// Add bus
-router.post('/add-bus', auth, managerOnly, async (req, res) => {
-  try {
-    const { busNumber, seats, busType, model } = req.body;
-    const companyID = req.user.companyID;
 
-    // Create bus with manager as addedBy
-    const bus = new Bus({
-      companyID,
-      addedBy: req.user._id,
-      busNumber,
-      seats,
-      busType,
-      model
-    });
-
-    await bus.save();
-    res.status(201).json({
-      message: 'Bus added successfully',
-      bus
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
 
 // Edit bus
 router.put('/edit-bus/:id', auth, managerOnly, async (req, res) => {
@@ -1087,104 +1656,56 @@ router.get('/notifications', auth, managerOnly, async (req, res) => {
 router.get('/export/staff', auth, managerOnly, async (req, res) => {
   try {
     const companyId = req.user.companyID || req.user._id;
-    
-    // Get all staff for the company with the required fields
     const staff = await Staff.find({ companyID: companyId })
       .select('username email phone gender age address staffType createdAt')
       .sort({ createdAt: -1 })
       .lean();
-
-    console.log('Found staff:', staff); // Debug log
-
-    // Create a new workbook and worksheet
-    const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet('Staff Directory');
-
-    // Add headers
-    worksheet.columns = [
-      { header: 'Name', key: 'name', width: 25 },
-      { header: 'Email', key: 'email', width: 30 },
-      { header: 'Phone', key: 'phone', width: 20 },
-      { header: 'Gender', key: 'gender', width: 10 },
-      { header: 'Age', key: 'age', width: 10 },
-      { header: 'Address', key: 'address', width: 40 },
-      { header: 'Staff Type', key: 'staffType', width: 15 },
-      { header: 'Join Date', key: 'joinDate', width: 15 }
-    ];
-
-    // Style header row
-    const headerRow = worksheet.getRow(1);
-    headerRow.eachCell((cell) => {
-      cell.font = { bold: true };
-      cell.fill = {
-        type: 'pattern',
-        pattern: 'solid',
-        fgColor: { argb: 'FFD3D3D3' }
-      };
-      cell.border = {
-        top: { style: 'thin' },
-        left: { style: 'thin' },
-        bottom: { style: 'thin' },
-        right: { style: 'thin' }
-      };
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=staff_directory_${new Date().toISOString().split('T')[0]}.pdf`);
+    const doc = new PDFDocument({ margin: 30, size: 'A4' });
+    doc.registerFont('Tajawal-Regular', tajawalFonts.regular);
+    doc.registerFont('Tajawal-Bold', tajawalFonts.bold);
+    doc.registerFont('Tajawal-Medium', tajawalFonts.medium);
+    const logoBuffer = await getSystemLogoBuffer();
+    addPdfHeader(doc, 'Staff Directory', tajawalFonts, logoBuffer);
+    let currentY = 190;
+    doc.font(tajawalFonts.bold).fontSize(16).fillColor('#1a5276').text('Staff List', 50, currentY);
+    currentY += 30;
+    // Table header
+    doc.font(tajawalFonts.medium).fontSize(12).fillColor('#2c3e50');
+    doc.text('Name', 50, currentY);
+    doc.text('Email', 150, currentY);
+    doc.text('Phone', 270, currentY);
+    doc.text('Gender', 350, currentY);
+    doc.text('Age', 410, currentY);
+    doc.text('Type', 450, currentY);
+    doc.text('Join Date', 510, currentY);
+    currentY += 18;
+    doc.moveTo(50, currentY).lineTo(560, currentY).lineWidth(0.5).stroke('#3498db');
+    currentY += 8;
+    doc.font(tajawalFonts.regular).fontSize(11).fillColor('#34495e');
+    staff.forEach(member => {
+      if (currentY > 750) {
+        doc.addPage();
+        addPdfHeader(doc, 'Staff Directory', tajawalFonts, logoBuffer);
+        currentY = 190;
+      }
+      doc.text(member.username || 'N/A', 50, currentY);
+      doc.text(member.email || 'N/A', 150, currentY);
+      doc.text(member.phone || 'N/A', 270, currentY);
+      doc.text(member.gender || 'N/A', 350, currentY);
+      doc.text(member.age || 'N/A', 410, currentY);
+      doc.text(member.staffType || 'N/A', 450, currentY);
+      doc.text(member.createdAt ? new Date(member.createdAt).toLocaleDateString() : 'N/A', 510, currentY);
+      currentY += 18;
     });
-
-    // Add data rows
-    staff.forEach((member) => {
-      const row = worksheet.addRow({
-        name: member.username || 'N/A',
-        email: member.email || 'N/A',
-        phone: member.phone || 'N/A',
-        gender: member.gender || 'N/A',
-        age: member.age || 'N/A',
-        address: member.address || 'N/A',
-        staffType: member.staffType || 'N/A',
-        joinDate: member.createdAt ? new Date(member.createdAt).toLocaleDateString() : 'N/A'
-      });
-
-      // Add borders to each cell in the row
-      row.eachCell((cell) => {
-        cell.border = {
-          top: { style: 'thin' },
-          left: { style: 'thin' },
-          bottom: { style: 'thin' },
-          right: { style: 'thin' }
-        };
-      });
-    });
-
-    // Auto-fit columns
-    worksheet.columns.forEach(column => {
-      let maxLength = 0;
-      column.eachCell({ includeEmpty: true }, (cell) => {
-        const columnLength = cell.value ? cell.value.toString().length : 10;
-        if (columnLength > maxLength) {
-          maxLength = columnLength;
-        }
-      });
-      column.width = Math.min(Math.max(maxLength + 2, 10), 50);
-    });
-
-    // Set response headers
-    res.setHeader(
-      'Content-Type',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    );
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename=staff_directory_${new Date().toISOString().split('T')[0]}.xlsx`
-    );
-
-    // Write the workbook to the response
-    await workbook.xlsx.write(res);
-    res.end();
+    addPdfFooter(doc, tajawalFonts);
+    doc.on('pageAdded', () => addPdfFooter(doc, tajawalFonts));
+    doc.pipe(res);
+    doc.end();
   } catch (error) {
     console.error('Export staff error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error exporting staff directory',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Error exporting staff directory', error: error.message });
   }
 });
 
@@ -1197,150 +1718,67 @@ router.get('/export/trips', auth, managerOnly, async (req, res) => {
   try {
     const companyId = req.user.companyID || req.user._id;
     const { startDate, endDate, status } = req.query;
-    
-    // Build query
     const query = { companyID: companyId };
-    
-    // Add date range filter if provided
     if (startDate && endDate) {
-      query.departureDate = {
-        $gte: new Date(startDate),
-        $lte: new Date(endDate)
-      };
+      query.departureDate = { $gte: new Date(startDate), $lte: new Date(endDate) };
     }
-    
-    // Add status filter if provided
-    if (status) {
-      query.status = status;
-    }
-
-    // Get trips with related data
+    if (status) query.status = status;
     const trips = await Trip.find(query)
       .populate({
         path: 'bus',
-        select: 'busNumber busType seats model driver',
-        populate: {
-          path: 'driver',
-          select: 'username phone staffType',
-          match: { staffType: 'driver' }
-        }
+        select: 'busNumber model driver',
+        populate: { path: 'driver', select: 'username phone staffType', match: { staffType: 'driver' } }
       })
       .sort({ departureDate: -1 })
       .lean();
-
-    // Create a new workbook and worksheet
-    const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet('Trips Report');
-
-    // Add headers with styling
-    const headerRow = worksheet.addRow([
-      'Origin', 'Destination', 'Departure Date', 'Departure Time',
-      'Arrival Date', 'Arrival Time', 'Bus Number', 'Bus Type',
-      'Seats', 'Model', 'Driver', 'Driver Phone', 'Status', 'Booked Seats'
-    ]);
-
-    // Style headers
-    headerRow.eachCell((cell) => {
-      cell.font = { bold: true };
-      cell.fill = {
-        type: 'pattern',
-        pattern: 'solid',
-        fgColor: { argb: 'FFD3D3D3' }
-      };
-    });
-
-    // Add data rows
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename=trips-report.pdf');
+    const doc = new PDFDocument({ margin: 30, size: 'A4' });
+    doc.registerFont('Tajawal-Regular', tajawalFonts.regular);
+    doc.registerFont('Tajawal-Bold', tajawalFonts.bold);
+    doc.registerFont('Tajawal-Medium', tajawalFonts.medium);
+    const logoBuffer = await getSystemLogoBuffer();
+    addPdfHeader(doc, 'Trips Report', tajawalFonts, logoBuffer);
+    let currentY = 190;
+    doc.font(tajawalFonts.bold).fontSize(16).fillColor('#1a5276').text('Trips List', 50, currentY);
+    currentY += 30;
+    // Table header
+    doc.font(tajawalFonts.medium).fontSize(12).fillColor('#2c3e50');
+    doc.text('Origin', 50, currentY);
+    doc.text('Destination', 120, currentY);
+    doc.text('Departure', 210, currentY);
+    doc.text('Arrival', 290, currentY);
+    doc.text('Bus', 370, currentY);
+    doc.text('Driver', 430, currentY);
+    doc.text('Status', 510, currentY);
+    currentY += 18;
+    doc.moveTo(50, currentY).lineTo(560, currentY).lineWidth(0.5).stroke('#3498db');
+    currentY += 8;
+    doc.font(tajawalFonts.regular).fontSize(11).fillColor('#34495e');
     for (const trip of trips) {
-      const bus = trip.bus || {};
-      let driverInfo = {
-        username: 'Not Assigned',
-        phone: 'N/A'
-      };
-
-      // Format dates and times
-      const departureDate = trip.departureDate ? new Date(trip.departureDate) : null;
-      const arrivalDate = trip.arrivalDate ? new Date(trip.arrivalDate) : null;
-
-      // Format date as YYYY-MM-DD
-      const formatDate = (date) => date ? date.toISOString().split('T')[0] : 'N/A';
-      
-      // Format time as HH:MM
-      const formatTime = (timeStr) => {
-        if (!timeStr) return 'N/A';
-        const [hours, minutes] = timeStr.split(':');
-        return `${hours.padStart(2, '0')}:${minutes || '00'}`;
-      };
-
-      // Handle driver information
-      if (bus.driver && typeof bus.driver === 'object' && bus.driver.staffType === 'driver') {
-        driverInfo = {
-          username: bus.driver.username || 'Not Assigned',
-          phone: bus.driver.phone || 'N/A'
-        };
-      } else if (bus.driver) {
-        try {
-          const driver = await Staff.findById(bus.driver).select('username phone staffType').lean();
-          if (driver && driver.staffType === 'driver') {
-            driverInfo = {
-              username: driver.username || 'Not Assigned',
-              phone: driver.phone || 'N/A'
-            };
-          }
-        } catch (error) {
-          console.error('Error fetching driver details:', error);
-        }
+      if (currentY > 750) {
+        doc.addPage();
+        addPdfHeader(doc, 'Trips Report', tajawalFonts, logoBuffer);
+        currentY = 190;
       }
-
-      worksheet.addRow([
-        trip.origin || 'N/A',
-        trip.destination || 'N/A',
-        formatDate(departureDate),
-        formatTime(trip.departureTime),
-        formatDate(arrivalDate),
-        formatTime(trip.arrivalTime),
-        bus.busNumber || 'N/A',
-        bus.busType ? bus.busType.charAt(0).toUpperCase() + bus.busType.slice(1) : 'N/A',
-        bus.seats || 0,
-        bus.model || 'N/A',
-        driverInfo.username,
-        driverInfo.phone,
-        trip.status ? trip.status.charAt(0).toUpperCase() + trip.status.slice(1) : 'N/A',
-        (bus.seats - (trip.seatsAvailable || 0))
-      ]);
+      const bus = trip.bus || {};
+      const driver = bus.driver || {};
+      doc.text(trip.origin || 'N/A', 50, currentY);
+      doc.text(trip.destination || 'N/A', 120, currentY);
+      doc.text(trip.departureDate ? new Date(trip.departureDate).toLocaleDateString() : 'N/A', 210, currentY);
+      doc.text(trip.arrivalDate ? new Date(trip.arrivalDate).toLocaleDateString() : 'N/A', 290, currentY);
+      doc.text(bus.busNumber || 'N/A', 370, currentY);
+      doc.text(driver.username || 'N/A', 430, currentY);
+      doc.text(trip.status ? trip.status.charAt(0).toUpperCase() + trip.status.slice(1) : 'N/A', 510, currentY);
+      currentY += 18;
     }
-
-    // Auto-fit columns
-    worksheet.columns.forEach(column => {
-      let maxLength = 0;
-      column.eachCell({ includeEmpty: true }, cell => {
-        const columnLength = cell.value ? cell.value.toString().length : 0;
-        if (columnLength > maxLength) {
-          maxLength = columnLength;
-        }
-      });
-      column.width = Math.min(Math.max(maxLength + 2, 10), 30); // Reduced max width for better fit
-    });
-
-    // Set response headers
-    res.setHeader(
-      'Content-Type',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    );
-    res.setHeader(
-      'Content-Disposition',
-      'attachment; filename=' + 'trips-report.xlsx'
-    );
-
-    // Send the workbook as a response
-    await workbook.xlsx.write(res);
-    res.end();
+    addPdfFooter(doc, tajawalFonts);
+    doc.on('pageAdded', () => addPdfFooter(doc, tajawalFonts));
+    doc.pipe(res);
+    doc.end();
   } catch (error) {
     console.error('Export trips error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error exporting trips report',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Error exporting trips report', error: error.message });
   }
 });
 
@@ -1351,181 +1789,64 @@ router.get('/export/trips', auth, managerOnly, async (req, res) => {
  */
 router.get('/export/bookings', auth, managerOnly, async (req, res) => {
   try {
-    console.log('=== Starting export bookings ===');
-    
-    // First, get all bookings without any filters
-    console.log('Fetching all bookings without filters...');
-    const allBookings = await Booking.find({}).lean();
-    console.log(`Found ${allBookings.length} total bookings in database`);
-    
-    if (allBookings.length > 0) {
-      console.log('Sample raw booking from DB:', JSON.stringify({
-        _id: allBookings[0]._id,
-        tripID: allBookings[0].tripID,
-        staffID: allBookings[0].staffID,
-        status: allBookings[0].status,
-        bookingType: allBookings[0].bookingType,
-        totalAmount: allBookings[0].totalAmount,
-        createdAt: allBookings[0].createdAt
-      }, null, 2));
-    }
-
-    // Now get bookings with populated data
-    console.log('Fetching bookings with populated data...');
-    const bookings = await Booking.find({})
-      .populate({
-        path: 'tripID',
-        select: 'origin destination departureDate arrivalDate',
-        options: { lean: true }
-      })
-      .populate({
-        path: 'staffID',
-        select: 'username email phone',
-        options: { lean: true }
-      })
+    const companyId = req.user.companyID || req.user._id;
+    const trips = await Trip.find({ companyID: companyId }).select('_id').lean();
+    const tripIds = trips.map(t => t._id);
+    const bookings = await Booking.find({ tripID: { $in: tripIds } })
+      .populate({ path: 'tripID', select: 'origin destination departureDate arrivalDate' })
+      .populate({ path: 'staffID', select: 'username email phone' })
       .sort({ createdAt: -1 })
       .lean();
-    
-    console.log(`Found ${bookings.length} bookings after population`);
-    if (bookings.length > 0) {
-      console.log('Sample populated booking:', JSON.stringify({
-        _id: bookings[0]._id,
-        tripID: bookings[0].tripID,
-        staffID: bookings[0].staffID,
-        status: bookings[0].status,
-        bookingType: bookings[0].bookingType,
-        totalAmount: bookings[0].totalAmount,
-        createdAt: bookings[0].createdAt
-      }, null, 2));
-    }
-
-    // Create a new workbook and worksheet
-    const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet('Bookings Report');
-
-    // Define columns with headers
-    worksheet.columns = [
-      { header: 'Customer', key: 'customer', width: 20 },
-      { header: 'Email', key: 'email', width: 30 },
-      { header: 'Phone', key: 'phone', width: 20 },
-      { header: 'Origin', key: 'origin', width: 20 },
-      { header: 'Destination', key: 'destination', width: 20 },
-      { header: 'Travel Date', key: 'travelDate', width: 15 },
-      { header: 'Seats', key: 'seats', width: 10 },
-      { header: 'Total Amount', key: 'totalAmount', width: 15, style: { numFmt: '$#,##0.00' } },
-      { header: 'Payment Status', key: 'paymentStatus', width: 15 },
-      { header: 'Booking Status', key: 'bookingStatus', width: 15 },
-      { header: 'Booking Type', key: 'bookingType', width: 15 },
-      { header: 'Booking Date', key: 'bookingDate', width: 20 }
-    ];
-
-    // Style header row
-    const headerRow = worksheet.getRow(1);
-    headerRow.eachCell((cell) => {
-      cell.font = { bold: true };
-      cell.fill = {
-        type: 'pattern',
-        pattern: 'solid',
-        fgColor: { argb: 'FFD3D3D3' }
-      };
-      cell.border = {
-        top: { style: 'thin' },
-        left: { style: 'thin' },
-        bottom: { style: 'thin' },
-        right: { style: 'thin' }
-      };
-    });
-
-    // Add data rows
-    let rowCount = 0;
-    for (const booking of bookings) {
-      try {
-        rowCount++;
-        console.log(`Processing booking ${rowCount}/${bookings.length}:`, booking._id);
-        
-        // Safely get values with null checks
-        const getValue = (obj, path, defaultValue = 'N/A') => {
-          try {
-            const value = path.split('.').reduce((o, p) => (o && o[p] !== undefined ? o[p] : null), booking);
-            return value !== null && value !== undefined ? value : defaultValue;
-          } catch (e) {
-            console.error(`Error getting value for path ${path}:`, e);
-            return defaultValue;
-          }
-        };
-
-        const rowData = {
-          customer: getValue(booking, 'staffID.username', 'Counter Sale'),
-          email: booking.userEmail || getValue(booking, 'staffID.email', 'N/A'),
-          phone: getValue(booking, 'staffID.phone'),
-          origin: getValue(booking, 'tripID.origin'),
-          destination: getValue(booking, 'tripID.destination'),
-          travelDate: booking.tripID?.departureDate ? 
-            new Date(booking.tripID.departureDate).toLocaleDateString() : 'N/A',
-          seats: Array.isArray(booking.assignedSeats) ? 
-            booking.assignedSeats.join(', ') : 
-            (booking.assignedSeats ? String(booking.assignedSeats) : 'N/A'),
-          totalAmount: booking.totalAmount || 0,
-          paymentStatus: booking.paymentStatus || 'Pending',
-          bookingStatus: booking.status || 'Confirmed',
-          bookingType: booking.bookingType || 'N/A',
-          bookingDate: booking.createdAt ? 
-            new Date(booking.createdAt).toLocaleString() : 'N/A'
-        };
-        
-        console.log(`Adding row ${rowCount} data:`, rowData);
-        const row = worksheet.addRow(rowData);
-
-        // Add borders to each cell in the row
-        row.eachCell((cell) => {
-          cell.border = {
-            top: { style: 'thin' },
-            left: { style: 'thin' },
-            bottom: { style: 'thin' },
-            right: { style: 'thin' }
-          };
-        });
-      } catch (rowError) {
-        console.error(`Error processing booking row ${rowCount}/${bookings.length} (${booking._id}):`, rowError);
-        console.error('Problematic booking data:', JSON.stringify(booking, null, 2));
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename=bookings_report.pdf');
+    const doc = new PDFDocument({ margin: 30, size: 'A4' });
+    doc.registerFont('Tajawal-Regular', tajawalFonts.regular);
+    doc.registerFont('Tajawal-Bold', tajawalFonts.bold);
+    doc.registerFont('Tajawal-Medium', tajawalFonts.medium);
+    const logoBuffer = await getSystemLogoBuffer();
+    addPdfHeader(doc, 'Bookings Report', tajawalFonts, logoBuffer);
+    let currentY = 190;
+    doc.font(tajawalFonts.bold).fontSize(16).fillColor('#1a5276').text('Bookings List', 50, currentY);
+    currentY += 30;
+    // Table header
+    doc.font(tajawalFonts.medium).fontSize(12).fillColor('#2c3e50');
+    doc.text('Customer', 50, currentY);
+    doc.text('Email', 130, currentY);
+    doc.text('Phone', 230, currentY);
+    doc.text('Origin', 310, currentY);
+    doc.text('Destination', 370, currentY);
+    doc.text('Date', 450, currentY);
+    doc.text('Seats', 510, currentY);
+    currentY += 18;
+    doc.moveTo(50, currentY).lineTo(560, currentY).lineWidth(0.5).stroke('#3498db');
+    currentY += 8;
+    doc.font(tajawalFonts.regular).fontSize(11).fillColor('#34495e');
+    bookings.forEach(booking => {
+      if (currentY > 750) {
+        doc.addPage();
+        addPdfHeader(doc, 'Bookings Report', tajawalFonts, logoBuffer);
+        currentY = 190;
       }
-    }
-    
-    console.log(`Successfully processed ${rowCount} bookings`);
-
-    // Auto-fit columns
-    worksheet.columns.forEach(column => {
-      if (!column || !column.eachCell) return;
-      
-      let maxLength = 0;
-      column.eachCell({ includeEmpty: true }, cell => {
-        let columnLength = 0;
-        if (cell.value !== null && cell.value !== undefined) {
-          columnLength = cell.value.toString().length;
-        }
-        if (columnLength > maxLength) {
-          maxLength = columnLength;
-        }
-      });
-      
-      // Set column width with reasonable limits (min: header length + 2, max: 50)
-      const headerLength = column.header ? column.header.length : 10;
-      column.width = Math.min(Math.max(maxLength + 2, headerLength + 2), 50);
+      const trip = booking.tripID || {};
+      // Use userEmail for both Customer and Email columns
+      doc.text(booking.userEmail || 'Counter Sale', 50, currentY);
+      doc.text(booking.userEmail || 'N/A', 130, currentY);
+      // Use first passenger's phone if available
+      const phone = (booking.passengers && booking.passengers[0] && booking.passengers[0].phone) ? booking.passengers[0].phone : 'N/A';
+      doc.text(phone, 230, currentY);
+      doc.text(trip.origin || 'N/A', 310, currentY);
+      doc.text(trip.destination || 'N/A', 370, currentY);
+      doc.text(trip.departureDate ? new Date(trip.departureDate).toLocaleDateString() : 'N/A', 450, currentY);
+      doc.text(Array.isArray(booking.assignedSeats) ? booking.assignedSeats.join(', ') : (booking.assignedSeats ? String(booking.assignedSeats) : 'N/A'), 510, currentY);
+      currentY += 18;
     });
-
-    // Set response headers
-    setExcelHeaders(res, 'bookings_report');
-
-    // Write the workbook to the response
-    await workbook.xlsx.write(res);
-    res.end();
+    addPdfFooter(doc, tajawalFonts);
+    doc.on('pageAdded', () => addPdfFooter(doc, tajawalFonts));
+    doc.pipe(res);
+    doc.end();
   } catch (error) {
     console.error('Export bookings error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error exporting bookings report',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Error exporting bookings report', error: error.message });
   }
 });
 
@@ -1538,310 +1859,123 @@ router.get('/export/financial-summary', auth, managerOnly, async (req, res) => {
   try {
     const companyId = req.user.companyID || req.user._id;
     const { startDate, endDate, groupBy = 'month' } = req.query;
-    
-    console.log('=== Starting financial summary export ===');
-    console.log('Company ID:', companyId);
-    console.log('Date range:', { startDate, endDate });
-    console.log('Group by:', groupBy);
-    
-    // Validate groupBy parameter
     const validGroupBy = ['day', 'week', 'month', 'year'];
     const groupByValue = validGroupBy.includes(groupBy) ? groupBy : 'month';
-    
-    console.log('Exporting financial summary for company:', companyId);
-    
-    // Convert companyId to ObjectId if it's a number
-    const companyObjectId = typeof companyId === 'number' 
-      ? (await Company.findOne({ companyID: companyId }))?._id 
-      : companyId;
-      
-    if (!companyObjectId) {
-      throw new Error('Company not found');
-    }
-    
-    console.log('Using company ObjectId:', companyObjectId);
-    
-    // Check total bookings in the database
-    const totalBookingsInDB = await Booking.countDocuments({});
-    console.log('Total bookings in database:', totalBookingsInDB);
-    
-    // Get a sample of all bookings to check their structure
-    const allBookingsSample = await Booking.find({}).limit(3).lean();
-    console.log('Sample of all bookings in database:', JSON.stringify(allBookingsSample.map(b => ({
-      _id: b._id,
-      companyId: b.companyId,
-      status: b.status,
-      paymentStatus: b.paymentStatus,
-      totalAmount: b.totalAmount,
-      createdAt: b.createdAt,
-      updatedAt: b.updatedAt
-    })), null, 2));
-    
-    // Check bookings for this company
-    const bookingsCount = await Booking.countDocuments({ companyId: companyObjectId });
-    console.log(`Total bookings for company ${companyObjectId}:`, bookingsCount);
-    
-    // Get sample of company's bookings to check their structure
-    const companyBookings = await Booking.find({ companyId: companyObjectId }).limit(3).lean();
-    console.log(`Sample of company's bookings:`, JSON.stringify(companyBookings, null, 2));
-    
-    // Build match query
-    // Include bookings with matching companyId OR no companyId (for backward compatibility)
+    const trips = await Trip.find({ companyID: companyId }).select('_id').lean();
+    const tripIds = trips.map(t => t._id);
     const matchQuery = {
-      $and: [
-        {
-          $or: [
-            { companyId: companyObjectId },
-            { companyId: { $exists: false } },
-            { companyId: null }
-          ]
-        },
-        { status: { $ne: 'cancelled' } },
-        { paymentStatus: 'paid' }
-      ]
+      tripID: { $in: tripIds },
+      status: { $ne: 'cancelled' },
+      paymentStatus: 'paid'
     };
-    
-    // Add date range filter if provided
     if (startDate && endDate) {
-      console.log('Filtering by date range:', { startDate, endDate });
-      matchQuery.createdAt = {
-        $gte: new Date(startDate),
-        $lte: new Date(endDate)
-      };
-    } else {
-      console.log('No date range filter applied');
+      matchQuery.createdAt = { $gte: new Date(startDate), $lte: new Date(endDate) };
     }
-    
-    console.log('Final match query:', JSON.stringify(matchQuery, null, 2));
-    
-    // Log the count of matching documents
-    const matchingCount = await Booking.countDocuments(matchQuery);
-    console.log(`Found ${matchingCount} matching bookings`);
-
-    // Format for grouping
     const dateFormat = {
-      day: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },  // Changed from bookingDate to createdAt
-      week: { $dateToString: { format: '%Y-%U', date: '$createdAt' } },   // Changed from bookingDate to createdAt
-      month: { $dateToString: { format: '%Y-%m', date: '$createdAt' } },  // Changed from bookingDate to createdAt
-      year: { $dateToString: { format: '%Y', date: '$createdAt' } }       // Changed from bookingDate to createdAt
+      day: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+      week: { $dateToString: { format: '%Y-%U', date: '$createdAt' } },
+      month: { $dateToString: { format: '%Y-%m', date: '$createdAt' } },
+      year: { $dateToString: { format: '%Y', date: '$createdAt' } }
     }[groupByValue];
-    
-    console.log('Grouping by:', groupByValue);
-
-    // Get financial summary
-    console.log('Fetching financial data...');
     const pipeline = [
       { $match: matchQuery },
-      {
-        $group: {
-          _id: dateFormat,
-          totalBookings: { $sum: 1 },
-          totalRevenue: { $sum: '$totalAmount' },
-          averageBookingValue: { $avg: '$totalAmount' },
-          date: { $first: '$createdAt' },
-          paymentStatuses: { $push: '$paymentStatus' }
-        }
-      },
+      { $group: {
+        _id: dateFormat,
+        totalBookings: { $sum: 1 },
+        totalRevenue: { $sum: '$totalAmount' },
+        averageBookingValue: { $avg: '$totalAmount' },
+        date: { $first: '$createdAt' },
+        paymentStatuses: { $push: '$paymentStatus' }
+      } },
       { $sort: { _id: 1 } }
     ];
-    
-    console.log('Aggregation pipeline:', JSON.stringify(pipeline, null, 2));
-    
     const financials = await Booking.aggregate(pipeline).allowDiskUse(true);
-    console.log(`Aggregation returned ${financials.length} results`);
-    
-    // If no results, try without the payment status filter to see if that's the issue
-    if (financials.length === 0) {
-      console.log('No results with paymentStatus filter, trying without it...');
-      const testMatch = { ...matchQuery };
-      delete testMatch.paymentStatus;
-      
-      const testPipeline = [
-        { $match: testMatch },
-        {
-          $group: {
-            _id: dateFormat,
-            totalBookings: { $sum: 1 },
-            totalRevenue: { $sum: '$totalAmount' },
-            averageBookingValue: { $avg: '$totalAmount' },
-            date: { $first: '$createdAt' },
-            paymentStatuses: { $push: '$paymentStatus' }
-          }
-        },
-        { $sort: { _id: 1 } }
-      ];
-      
-      const testResults = await Booking.aggregate(testPipeline).allowDiskUse(true);
-      console.log(`Test query returned ${testResults.length} results`);
-      if (testResults.length > 0) {
-        console.log('Payment statuses in data:', [...new Set(testResults.flatMap(r => r.paymentStatuses))]);
-      }
-    }
-    
-    console.log(`Found ${financials.length} financial records`);
-    if (financials.length > 0) {
-      console.log('Sample financial record:', JSON.stringify(financials[0], null, 2));
-    }
-
-    // Get payment methods distribution
-    console.log('Fetching payment methods distribution...');
-    const paymentMethods = await Booking.aggregate([
-      { $match: matchQuery },
-      {
-        $lookup: {
-          from: 'payments',
-          localField: '_id',
-          foreignField: 'bookingID',
-          as: 'payment'
-        }
-      },
-      { $unwind: { path: '$payment', preserveNullAndEmptyArrays: true } },
-      {
-        $group: {
-          _id: { $ifNull: ['$payment.paymentMethod', 'Unknown'] },
-          count: { $sum: 1 },
-          total: { $sum: '$totalAmount' }
-        }
-      },
-      { $sort: { total: -1 } }
-    ]).allowDiskUse(true);  // Added allowDiskUse for large datasets
-    
-    console.log(`Found ${paymentMethods.length} payment methods`);
-    if (paymentMethods.length > 0) {
-      console.log('Sample payment method:', JSON.stringify(paymentMethods[0], null, 2));
-    }
-
-    // Create a new workbook
-    const workbook = new ExcelJS.Workbook();
-    
-    // Add Summary sheet
-    const summarySheet = workbook.addWorksheet('Summary');
-    
-    // Calculate totals
-    const totalBookingsCount = financials.reduce((sum, item) => sum + (item.totalBookings || 0), 0);
-    const totalRevenue = financials.reduce((sum, item) => sum + (item.totalRevenue || 0), 0);
-    
-    // Add summary data
-    summarySheet.addRow(['Financial Summary']);
-    summarySheet.addRow(['Period', startDate && endDate ? `${startDate} to ${endDate}` : 'All Time']);
-    summarySheet.addRow(['Grouped By', groupByValue]);
-    summarySheet.addRow([]);
-    
-    // Add financial totals
-    summarySheet.addRow(['Total Revenue', `$${totalRevenue.toFixed(2)}`]);
-    summarySheet.addRow(['Total Bookings', totalBookingsCount]);
-    summarySheet.addRow(['Average Booking Value', `$${(totalRevenue / (totalBookingsCount || 1)).toFixed(2)}`]);
-    
-    // Add payment methods
-    summarySheet.addRow([]);
-    summarySheet.addRow(['Payment Methods']);
-    paymentMethods.forEach(method => {
-      summarySheet.addRow([
-        method._id || 'Unknown',
-        method.count,
-        `$${method.total.toFixed(2)}`,
-        `${((method.total / (totalRevenue || 1)) * 100).toFixed(1)}%`
-      ]);
-    });
-    
-    // Style summary sheet
-    summarySheet.getCell('A1').font = { bold: true, size: 14 };
-    summarySheet.getCell('A6').font = { bold: true };
-    summarySheet.getCell('A8').font = { bold: true };
-    
-    // Add Financial Data sheet
-    const dataSheet = workbook.addWorksheet('Financial Data');
-    
-    // Add headers
-    const headerRow = dataSheet.addRow([
-      'Period', 'Total Bookings', 'Total Revenue', 'Average Booking Value'
-    ]);
-    
-    // Style header row
-    headerRow.eachCell((cell) => {
-      cell.font = { bold: true };
-      cell.fill = {
-        type: 'pattern',
-        pattern: 'solid',
-        fgColor: { argb: 'FFD3D3D3' }
-      };
-      cell.border = {
-        top: { style: 'thin' },
-        left: { style: 'thin' },
-        bottom: { style: 'thin' },
-        right: { style: 'thin' }
-      };
-    });
-    
-    // Add data rows
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename=financial_summary.pdf');
+    const doc = new PDFDocument({ margin: 30, size: 'A4' });
+    doc.registerFont('Tajawal-Regular', tajawalFonts.regular);
+    doc.registerFont('Tajawal-Bold', tajawalFonts.bold);
+    doc.registerFont('Tajawal-Medium', tajawalFonts.medium);
+    const logoBuffer = await getSystemLogoBuffer();
+    addPdfHeader(doc, 'Financial Summary', tajawalFonts, logoBuffer);
+    let currentY = 190;
+    doc.font(tajawalFonts.bold).fontSize(16).fillColor('#1a5276').text('Financial Data', 50, currentY);
+    currentY += 30;
+    // Table header
+    doc.font(tajawalFonts.medium).fontSize(12).fillColor('#2c3e50');
+    doc.text('Period', 50, currentY);
+    doc.text('Bookings', 150, currentY);
+    doc.text('Revenue', 250, currentY);
+    doc.text('Avg Value', 350, currentY);
+    currentY += 18;
+    doc.moveTo(50, currentY).lineTo(560, currentY).lineWidth(0.5).stroke('#3498db');
+    currentY += 8;
+    doc.font(tajawalFonts.regular).fontSize(11).fillColor('#34495e');
     financials.forEach(item => {
-      const row = dataSheet.addRow([
-        item._id,
-        item.totalBookings,
-        item.totalRevenue,
-        item.averageBookingValue
-      ]);
-      
-      // Add borders to each cell in the row
-      row.eachCell((cell) => {
-        cell.border = {
-          top: { style: 'thin' },
-          left: { style: 'thin' },
-          bottom: { style: 'thin' },
-          right: { style: 'thin' }
-        };
-      });
+      if (currentY > 750) {
+        doc.addPage();
+        addPdfHeader(doc, 'Financial Summary', tajawalFonts, logoBuffer);
+        currentY = 190;
+      }
+      doc.text(item._id, 50, currentY);
+      doc.text(item.totalBookings, 150, currentY);
+      doc.text(`$${item.totalRevenue.toFixed(2)}`, 250, currentY);
+      doc.text(`$${item.averageBookingValue.toFixed(2)}`, 350, currentY);
+      currentY += 18;
     });
-    
-    // Format currency columns
-    const formatCurrency = (sheet, column) => {
-      sheet.getColumn(column).eachCell((cell) => {
-        if (cell.value !== undefined && cell.value !== 'Total Revenue' && cell.value !== 'Average Booking Value') {
-          cell.numFmt = '$#,##0.00';
-        }
-      });
-    };
-    
-    formatCurrency(dataSheet, 'C'); // Total Revenue
-    formatCurrency(dataSheet, 'D'); // Average Booking Value
-    
-    // Auto-fit columns
-    [summarySheet, dataSheet].forEach(sheet => {
-      sheet.columns.forEach(column => {
-        let maxLength = 0;
-        column.eachCell({ includeEmpty: true }, (cell) => {
-          const columnLength = cell.value ? cell.value.toString().length : 10;
-          if (columnLength > maxLength) {
-            maxLength = columnLength;
-          }
-        });
-        column.width = Math.min(Math.max(maxLength + 2, 10), 40);
-      });
-    });
-    
-    // Set response headers
-    setExcelHeaders(res, 'financial_summary');
-    
-    // Write the workbook to the response
-    await workbook.xlsx.write(res);
-    res.end();
+    addPdfFooter(doc, tajawalFonts);
+    doc.on('pageAdded', () => addPdfFooter(doc, tajawalFonts));
+    doc.pipe(res);
+    doc.end();
   } catch (error) {
     console.error('Export financial summary error:', error);
+    res.status(500).json({ success: false, message: 'Error exporting financial summary', error: error.message });
+  }
+});
+
+/**
+ * @route   PUT /api/company/notifications/:id/read
+ * @desc    Mark a specific notification as read
+ * @access  Private/Manager
+ */
+router.put('/notifications/:id/read', auth, managerOnly, async (req, res) => {
+  try {
+    const notificationId = req.params.id;
+    const companyId = req.user.companyID || req.user._id;
+
+    // Find the notification and verify it belongs to this company
+    const notification = await Notification.findOne({
+      _id: notificationId,
+      companyID: companyId
+    });
+
+    if (!notification) {
+      return res.status(404).json({
+        success: false,
+        message: 'Notification not found or access denied'
+      });
+    }
+
+    // Mark as read if not already read
+    if (!notification.isRead) {
+      notification.isRead = true;
+      notification.readAt = new Date();
+      await notification.save();
+    }
+
+    res.json({
+      success: true,
+      message: 'Notification marked as read',
+      notification
+    });
+  } catch (error) {
+    console.error('Error marking notification as read:', error);
     res.status(500).json({
       success: false,
-      message: 'Error exporting financial summary',
+      message: 'Failed to mark notification as read',
       error: error.message
     });
   }
 });
 
 module.exports = router;
-
-
-
-
-
-
-
-
-

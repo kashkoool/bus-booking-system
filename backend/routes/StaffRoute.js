@@ -9,19 +9,150 @@ const Trip = require('../models/Trip');
 const Customer = require('../models/Customer');
 const Payment = require('../models/Payment');
 const Company = require('../models/Company');
+const Staff = require('../models/Staff');
 
 // Staff dashboard
-router.get('/dashboard', auth, staffOnly, (req, res) => {
-  res.json({
-    message: 'Staff Dashboard',
-    user: req.user,
-    company: req.user.companyID
-  });
+router.get('/dashboard', auth, staffOnly, async (req, res) => {
+  try {
+    const staffId = req.user._id;
+    const companyId = req.user.companyID;
+
+    // Get staff profile
+    const staffProfile = await Staff.findById(staffId)
+      .select('username email phone gender age address staffType createdAt')
+      .lean();
+
+    // Get upcoming trips for the company
+    const upcomingTrips = await Trip.find({
+      companyID: companyId,
+      departureDate: { $gte: new Date() },
+      status: { $in: ['scheduled', 'active'] }
+    })
+    .populate('bus', 'busNumber busType')
+    .sort({ departureDate: 1 })
+    .limit(5)
+    .lean();
+
+    // Get recent activity (recent bookings made by this staff)
+    const recentActivity = await Booking.find({
+      staffID: staffId,
+      createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } // Last 7 days
+    })
+    .populate('tripID', 'origin destination departureDate')
+    .sort({ createdAt: -1 })
+    .limit(10)
+    .lean();
+
+    // Format recent activity
+    const formattedActivity = recentActivity.map(booking => ({
+      description: `تم إنشاء حجز لرحلة ${booking.tripID?.origin} - ${booking.tripID?.destination}`,
+      date: booking.createdAt,
+      type: 'booking',
+      bookingId: booking._id
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        profile: staffProfile,
+        upcomingTrips,
+        recentActivity: formattedActivity
+      }
+    });
+  } catch (error) {
+    console.error('Staff dashboard error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error loading staff dashboard',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
 });
 
+// Staff notifications endpoint
+router.get('/notifications', auth, staffOnly, async (req, res) => {
+  try {
+    const staffId = req.user._id;
+    const companyId = req.user.companyID;
 
+    // Get notifications for staff (recent bookings, trip updates, etc.)
+    const notifications = await Booking.find({
+      staffID: staffId,
+      createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } // Last 24 hours
+    })
+    .populate('tripID', 'origin destination departureDate status')
+    .sort({ createdAt: -1 })
+    .limit(20)
+    .lean();
 
+    // Format notifications
+    const formattedNotifications = notifications.map(booking => ({
+      _id: booking._id,
+      message: `تم إنشاء حجز جديد لرحلة ${booking.tripID?.origin} - ${booking.tripID?.destination}`,
+      type: 'booking_created',
+      isRead: false,
+      createdAt: booking.createdAt,
+      bookingId: booking._id,
+      tripId: booking.tripID?._id,
+      totalAmount: booking.totalAmount,
+      passengers: booking.passengers
+    }));
 
+    res.json({
+      success: true,
+      notifications: formattedNotifications
+    });
+  } catch (error) {
+    console.error('Staff notifications error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error loading notifications',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Staff profile update endpoint
+router.put('/profile', auth, staffOnly, async (req, res) => {
+  try {
+    const staffId = req.user._id;
+    const { username, email, phone, address, age, gender } = req.body;
+
+    // Find and update staff profile
+    const updatedStaff = await Staff.findByIdAndUpdate(
+      staffId,
+      {
+        username,
+        email,
+        phone,
+        address,
+        age,
+        gender
+      },
+      { new: true, runValidators: true }
+    ).select('-password');
+
+    if (!updatedStaff) {
+      return res.status(404).json({
+        success: false,
+        message: 'Staff not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Profile updated successfully',
+      data: updatedStaff
+    });
+  } catch (error) {
+    console.error('Staff profile update error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating profile',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
 
 // @route   POST /api/staff/counter-booking
 // @desc    Create a new booking at the counter (staff only)
@@ -37,7 +168,9 @@ router.post('/counter-booking', [auth, staffOnly,[
     check('userEmail', 'User email is required').optional().isEmail(),
     check('amountPaid', 'Amount paid is required').isNumeric().toFloat()
   ]
-], async (req, res) => {
+
+],
+ async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({ errors: errors.array() });
@@ -91,7 +224,7 @@ router.post('/counter-booking', [auth, staffOnly,[
     }
 
     // Look up customer by email if provided, otherwise use staff's company
-    let customer = staffMember; // Default to staff member
+    let customer = null;
     if (userEmail) {
       customer = await Customer.findOne({ email: userEmail, role: 'customer' });
       if (!customer) {
@@ -152,7 +285,7 @@ router.post('/counter-booking', [auth, staffOnly,[
 
     // Create booking with assigned seats as a flat array
     const booking = new Booking({
-      userEmail: user ? user.email : null,
+      userEmail: customer ? customer.email : null,
       tripID: trip._id,
       passengers,
       noOfSeats,
@@ -170,8 +303,8 @@ router.post('/counter-booking', [auth, staffOnly,[
     // Create and process payment for all bookings
     const payment = new Payment({
       bookingID: booking._id,
-      user: user ? user._id : null,  // Save user ID if available, otherwise null
-      userEmail: user ? user.email : null,  // Save email if available, otherwise null
+      user: customer ? customer._id : null,  // Save user ID if available, otherwise null
+      userEmail: customer ? customer.email : null,  // Save email if available, otherwise null
       amount: totalAmount,
       currency: 'SYP',
       status: 'completed',
@@ -275,9 +408,34 @@ router.get('/counter-refunds', [auth, staffOnly], async (req, res) => {
       .skip(skip)
       .limit(limit);
 
+    // Fetch transactionId for each booking
+    const bookingsWithTransactionId = await Promise.all(bookings.map(async (booking) => {
+      let transactionId = null;
+      let cancelledByUsername = null;
+      if (booking.paymentID) {
+        const payment = await Payment.findById(booking.paymentID).select('transactionId');
+        if (payment) transactionId = payment.transactionId;
+      }
+      // Try to populate cancelledBy username
+      let cancelledBy = booking.cancellation?.cancelledBy || null;
+      if (cancelledBy) {
+        const staff = await Staff.findById(cancelledBy).select('username');
+        if (staff) cancelledByUsername = staff.username;
+      }
+      const obj = booking.toObject();
+      return {
+        ...obj,
+        transactionId,
+        refundStatus: obj.refundStatus || 'غير متوفر',
+        cancelledAt: obj.cancelledAt || (obj.cancellation && obj.cancellation.cancelledAt) || null,
+        cancellationReason: obj.cancellation?.reason || 'غير متوفر',
+        cancelledBy: cancelledByUsername || cancelledBy || 'غير متوفر'
+      };
+    }));
+
     res.json({
       success: true,
-      data: bookings,
+      data: bookingsWithTransactionId,
       pagination: {
         total,
         page,
@@ -366,7 +524,7 @@ router.get('/show-counter-bookings', auth, staffOnly, async (req, res) => {
         amount: payment.amount,
         currency: payment.currency,
         status: payment.status,
-        paidAt: payment.paidAt,
+        paidAt: payment.paymentDate,
         booking: {
           _id: booking._id,
           reference: booking.bookingReference,
@@ -554,17 +712,21 @@ router.put('/bookings/:bookingId/cancel', auth, staffOnly, async (req, res) => {
     }
 
     // Update booking status to cancelled
+    const now = new Date();
     booking.status = 'cancelled';
+    booking.paymentStatus = 'refunded'; // Update payment status to refunded
+    booking.refundStatus = 'processed'; // Set refundStatus to processed
+    booking.cancelledAt = now;
     booking.cancellation = {
       reason: 'Cancelled by staff',
       cancelledBy: req.user._id,
-      cancelledAt: new Date()
+      cancelledAt: now
     };
     await booking.save(queryOptions);
 
     // Update payment status to refunded
     payment.status = 'refunded';
-    payment.refundedAt = new Date();
+    payment.refundedAt = now;
     payment.refundReason = 'Booking cancelled';
     await payment.save(queryOptions);
     
@@ -680,8 +842,50 @@ router.get('/trips/search', auth, staffOnly, async (req, res) => {
   }
 });
 
-
-
-
+/**
+ * @route   PUT /api/staff/counter-refunds/:bookingId/confirm
+ * @desc    Confirm refund for a company-cancelled counter booking
+ * @access  Private (Staff)
+ */
+router.put('/counter-refunds/:bookingId/confirm', auth, staffOnly, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    // Find the booking
+    const booking = await Booking.findOne({
+      _id: bookingId,
+      bookingType: 'counter',
+      status: 'company-cancelled',
+      paymentStatus: 'paid',
+      refundStatus: { $ne: 'refunded' }
+    });
+    console.log('DEBUG: bookingId:', bookingId);
+    console.log('DEBUG: booking found:', booking);
+    if (!booking) {
+      console.log('DEBUG: Booking not found or already refunded');
+      return res.status(404).json({ success: false, message: 'الحجز غير موجود أو تم استرداده بالفعل' });
+    }
+    // Find the payment
+    const payment = await Payment.findById(booking.paymentID);
+    console.log('DEBUG: paymentID:', booking.paymentID);
+    console.log('DEBUG: payment found:', payment);
+    if (!payment) {
+      console.log('DEBUG: Payment not found');
+      return res.status(404).json({ success: false, message: 'المعاملة غير موجودة' });
+    }
+    // Update booking and payment
+    booking.paymentStatus = 'refunded';
+    booking.refundStatus = 'processed';
+    booking.refundProcessedAt = new Date();
+    await booking.save();
+    payment.status = 'refunded';
+    payment.refundedAt = new Date();
+    await payment.save();
+    console.log('DEBUG: refund confirmed successfully');
+    res.json({ success: true, message: 'تم تأكيد الاسترداد بنجاح', booking });
+  } catch (error) {
+    console.error('Error confirming refund:', error);
+    res.status(500).json({ success: false, message: 'حدث خطأ أثناء تأكيد الاسترداد', error: error.message });
+  }
+});
 
 module.exports = router;

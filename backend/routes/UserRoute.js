@@ -19,6 +19,7 @@ const { customerOnly } = require("../middleware/roleMiddleware");
 const { body, check, validationResult } = require("express-validator");
 const NodeCache = require("node-cache");
 const Notification = require("../models/Notification");
+const QRCode = require('qrcode');
 
 // For backward compatibility
 const userOnly = customerOnly;
@@ -305,10 +306,19 @@ router.get("/dashboard", auth, customerOnly, async (req, res) => {
     // Build trip query from filters
     const tripQuery = buildTripQuery(req.query);
 
-    // Get filtered trips
-    const trips = await Trip.find(tripQuery)
+    // Exclude trips that have already departed (date/time in the past)
+    const now = new Date();
+    const trips = (await Trip.find(tripQuery)
       .sort({ departureDate: 1, departureTime: 1 })
-      .lean();
+      .lean())
+      .filter(trip => {
+        // Combine departureDate and departureTime into a single Date object
+        if (!trip.departureDate || !trip.departureTime) return false;
+        const [hours, minutes] = trip.departureTime.split(':').map(Number);
+        const depDate = new Date(trip.departureDate);
+        depDate.setHours(hours || 0, minutes || 0, 0, 0);
+        return depDate >= now;
+      });
 
     console.log(`Debug: Found ${trips.length} trips matching filters`);
 
@@ -326,8 +336,8 @@ router.get("/dashboard", auth, customerOnly, async (req, res) => {
 
     // Get company information
     const companies = await Company.find(
-      { companyID: { $in: companyIds } },
-      "companyID companyName logo"
+      { companyID: { $in: companyIds }, status: 'active' },
+      "companyID companyName logo status"
     ).lean();
 
     console.log(`Found ${companies.length} companies`);
@@ -338,12 +348,14 @@ router.get("/dashboard", auth, customerOnly, async (req, res) => {
       return acc;
     }, {});
 
-    // Attach company info to each trip
-    const tripsWithCompany = trips.map((trip) => ({
-      ...trip,
-      id: trip._id,
-      company: companyMap[trip.companyID] || null,
-    }));
+    // Attach company info to each trip, but only include trips with active companies
+    const tripsWithCompany = trips
+      .map((trip) => ({
+        ...trip,
+        id: trip._id,
+        company: companyMap[trip.companyID] || null,
+      }))
+      .filter((trip) => trip.company && trip.company.status === 'active');
 
     // Simple pagination
     const page = parseInt(req.query.page) || 1;
@@ -644,9 +656,12 @@ router.get("/trips/:tripId/available-seats",
         .filter((seat, index, self) => self.indexOf(seat) === index); // Remove duplicates
       console.log("Taken seats:", takenSeats); // Debug log
 
-      // Generate available seats (1 to bus.seats)
+      // Use the database's seatsAvailable as the source of truth
+      const availableCount = trip.seatsAvailable || 0;
+      
+      // Generate available seats array based on the count
       const availableSeats = [];
-      for (let i = 1; i <= trip.bus.seats; i++) {
+      for (let i = 1; i <= trip.bus.seats && availableSeats.length < availableCount; i++) {
         if (!takenSeats.includes(i)) {
           availableSeats.push(i);
         }
@@ -657,8 +672,9 @@ router.get("/trips/:tripId/available-seats",
         data: {
           availableSeats,
           totalSeats: trip.bus.seats,
-          availableCount: availableSeats.length,
+          availableCount: availableCount,
           takenSeats, // Added for debugging
+          databaseSeatsAvailable: trip.seatsAvailable, // Debug info
         },
       });
     } catch (error) {
@@ -1175,6 +1191,10 @@ function detectCardBrand(cardNumber) {
  * @body    {string} passengers[].phone - Passenger's phone number
  */
 router.post("/book-trip", auth, customerOnly, async (req, res) => {
+  // Only use transactions in production (requires replica set)
+  const useTransactions = process.env.NODE_ENV === 'production';
+  const session = useTransactions ? await mongoose.startSession() : null;
+  
   try {
     const { tripID, noOfSeats, passengers } = req.body;
     const userId = req.user.id;
@@ -1185,11 +1205,39 @@ router.post("/book-trip", auth, customerOnly, async (req, res) => {
       noOfSeats,
       passengersCount: passengers?.length,
       userEmail,
+      timestamp: new Date().toISOString()
     });
 
-    // Validate trip exists
-    const trip = await Trip.findById(tripID);
+    // Check if user is blocked from booking
+    const socketIO = req.app.get('io');
+    if (socketIO && socketIO.blockedUsers) {
+      const blockData = socketIO.blockedUsers.get(userId);
+      if (blockData && Date.now() < blockData.expiresAt) {
+        const remainingTime = Math.ceil((blockData.expiresAt - Date.now()) / 1000);
+        return res.status(429).json({
+          success: false,
+          message: `You are blocked from booking for ${remainingTime} more seconds. Reason: ${blockData.reason}`,
+          blocked: true,
+          remainingTime,
+          reason: blockData.reason,
+          expiresAt: blockData.expiresAt
+        });
+      }
+    }
+
+    // Start transaction only if using transactions
+    if (useTransactions) {
+      session.startTransaction();
+    }
+
+    // Validate trip exists with session
+    const trip = useTransactions 
+      ? await Trip.findById(tripID).session(session)
+      : await Trip.findById(tripID);
     if (!trip) {
+      if (useTransactions) {
+        await session.abortTransaction();
+      }
       return res.status(404).json({
         success: false,
         message: "Trip not found",
@@ -1198,6 +1246,9 @@ router.post("/book-trip", auth, customerOnly, async (req, res) => {
 
     // Validate number of seats
     if (!noOfSeats || noOfSeats < 1) {
+      if (useTransactions) {
+        await session.abortTransaction();
+      }
       return res.status(400).json({
         success: false,
         message: "Number of seats must be at least 1",
@@ -1206,30 +1257,95 @@ router.post("/book-trip", auth, customerOnly, async (req, res) => {
 
     // Validate passengers array
     if (!Array.isArray(passengers) || passengers.length !== noOfSeats) {
+      if (useTransactions) {
+        await session.abortTransaction();
+      }
       return res.status(400).json({
         success: false,
         message: "Passengers array must match number of seats",
       });
     }
 
-    // Get available seats
+    // ATOMIC SEAT ASSIGNMENT - This is the critical section for conflict resolution
+    // Get available seats with session to ensure consistency
     const availableSeats = await trip.getNextAvailableSeats(noOfSeats);
     console.log("Available seats:", availableSeats);
 
     if (availableSeats.length < noOfSeats) {
+      if (useTransactions) {
+        await session.abortTransaction();
+      }
       return res.status(400).json({
         success: false,
         message: `Only ${availableSeats.length} seats available`,
+        availableSeats: availableSeats.length,
+        requestedSeats: noOfSeats
       });
     }
 
+    // Double-check seat availability by querying existing bookings
+    const aggregateQuery = [
+      {
+        $match: {
+          tripID: new mongoose.Types.ObjectId(tripID),
+          status: { $ne: 'cancelled' }
+        }
+      },
+      {
+        $unwind: '$assignedSeats'
+      },
+      {
+        $group: {
+          _id: null,
+          bookedSeats: { $addToSet: '$assignedSeats' }
+        }
+      }
+    ];
+
+    const existingBookings = useTransactions 
+      ? await Booking.aggregate(aggregateQuery).session(session)
+      : await Booking.aggregate(aggregateQuery);
+
+    const bookedSeats = new Set(existingBookings[0]?.bookedSeats || []);
+    const actuallyAvailableSeats = [];
+    
+    // Check if our requested seats are still available
+    for (let i = 1; i <= trip.seats && actuallyAvailableSeats.length < noOfSeats; i++) {
+      if (!bookedSeats.has(i)) {
+        actuallyAvailableSeats.push(i);
+      }
+    }
+
+    if (actuallyAvailableSeats.length < noOfSeats) {
+      if (useTransactions) {
+        await session.abortTransaction();
+      }
+      return res.status(409).json({
+        success: false,
+        message: `Seats no longer available. Only ${actuallyAvailableSeats.length} seats left.`,
+        availableSeats: actuallyAvailableSeats.length,
+        requestedSeats: noOfSeats,
+        conflict: true
+      });
+    }
+
+    // Use the actually available seats
+    const finalSeats = actuallyAvailableSeats.slice(0, noOfSeats);
+
     // Get customer with default credit card
-    const customer = await Customer.findById(userId).populate({
+    const customerQuery = Customer.findById(userId).populate({
       path: 'defaultPaymentMethod',
       model: 'CreditCard'
     });
     
+    const customer = useTransactions 
+      ? await customerQuery.session(session)
+      : await customerQuery;
+    
     if (!customer) {
+      if (useTransactions) {
+        await session.abortTransaction();
+      }
       return res.status(404).json({
         success: false,
         message: "Customer not found"
@@ -1239,6 +1355,7 @@ router.post("/book-trip", auth, customerOnly, async (req, res) => {
     const creditCard = customer.defaultPaymentMethod;
 
     if (!creditCard) {
+      await session.abortTransaction();
       console.error(`No default credit card found for user: ${userId}`);
       return res.status(400).json({
         success: false,
@@ -1252,6 +1369,9 @@ router.post("/book-trip", auth, customerOnly, async (req, res) => {
     
     // Verify credit card has sufficient balance
     if (creditCard.balance < totalAmount) {
+      if (useTransactions) {
+        await session.abortTransaction();
+      }
       return res.status(400).json({
         success: false,
         message: `الرصيد غير كافي. المطلوب: ${totalAmount} ل.س، المتاح: ${creditCard.balance} ل.س`,
@@ -1265,10 +1385,10 @@ router.post("/book-trip", auth, customerOnly, async (req, res) => {
       tripID: trip._id,
       passengers: passengers.map((p, index) => ({
         ...p,
-        seatNumber: availableSeats[index],
+        seatNumber: finalSeats[index],
       })),
       noOfSeats,
-      assignedSeats: availableSeats,
+      assignedSeats: finalSeats,
       totalAmount,
       status: "confirmed",
       bookingType: "online",
@@ -1291,90 +1411,137 @@ router.post("/book-trip", auth, customerOnly, async (req, res) => {
       },
     });
 
-    // Only use transactions in production where replica set is configured
-    const useTransactions = process.env.NODE_ENV === 'production';
-    let session = null;
-
-    if (useTransactions) {
-      session = await mongoose.startSession();
-      session.startTransaction();
-    }
-
     try {
-      // Save both booking and payment
-      const saveOptions = useTransactions ? { session } : {};
-      
-      await booking.save(saveOptions);
+      // Save both booking and payment atomically
+      await booking.save({ session: useTransactions ? session : undefined });
       payment.bookingID = booking._id;
-      await payment.save(saveOptions);
+      await payment.save({ session: useTransactions ? session : undefined });
 
       // Update credit card balance
       creditCard.balance -= totalAmount;
-      await creditCard.save(saveOptions);
+      await creditCard.save({ session: useTransactions ? session : undefined });
 
       // Update trip's available seats
       trip.seatsAvailable -= noOfSeats;
-      await trip.save(saveOptions);
+      await trip.save({ session: useTransactions ? session : undefined });
 
       // Update booking with payment ID
       booking.paymentID = payment._id;
       booking.paymentStatus = "paid";
-      await booking.save(saveOptions);
+      await booking.save({ session: useTransactions ? session : undefined });
 
       // Update payment status
       payment.status = "completed";
-      await payment.save(saveOptions);
+      await payment.save({ session: useTransactions ? session : undefined });
 
-      // Commit the transaction if using transactions
+      // Commit the transaction only if using transactions
       if (useTransactions) {
         await session.commitTransaction();
       }
+      
+      console.log(`✅ Booking successful: User ${userEmail} booked ${noOfSeats} seats (${finalSeats.join(', ')}) for trip ${tripID}`);
+
     } catch (error) {
-      // If anything fails, abort the transaction if using transactions
-      if (useTransactions && session) {
+      // If anything fails, abort the transaction only if using transactions
+      if (useTransactions) {
         await session.abortTransaction();
       }
       throw error;
-    } finally {
-      if (session) {
-        session.endSession();
-      }
     }
 
     // Clear any cached data that might be affected by this booking
     clearUserDashboardCache(userId);
 
+    // Emit real-time updates to all connected clients
+    const socketInstance = req.app.get('io');
+    if (socketInstance) {
+      console.log('🎯 Emitting real-time updates...');
+      console.log('📊 Trip ID:', tripID);
+      console.log('📊 Seats Available:', trip.seatsAvailable);
+      console.log('📊 Booking ID:', booking._id);
+      console.log('📊 Assigned Seats:', booking.assignedSeats);
+      
+      // Emit booking update to all users watching this trip
+      socketInstance.to(`trip-${tripID}`).emit('booking-updated', {
+        tripId: tripID,
+        seatsAvailable: trip.seatsAvailable,
+        bookingId: booking._id,
+        assignedSeats: booking.assignedSeats,
+        timestamp: new Date().toISOString(),
+        bookedBy: userEmail
+      });
+
+      // Emit to all connected clients for dashboard updates
+      socketInstance.emit('new-booking', {
+        tripId: tripID,
+        bookingId: booking._id,
+        userEmail: userEmail,
+        totalAmount: totalAmount,
+        timestamp: new Date().toISOString()
+      });
+
+      console.log(`✅ Real-time updates emitted for trip ${tripID}`);
+      console.log(`📡 Sent to room: trip-${tripID}`);
+      console.log(`📡 Sent to all clients`);
+      
+      // Debug: Log all connected sockets
+      const room = socketInstance.sockets.adapter.rooms.get(`trip-${tripID}`);
+      if (room) {
+        console.log(`📊 Users in room trip-${tripID}:`, room.size);
+        room.forEach(socketId => {
+          console.log(`  - Socket: ${socketId}`);
+        });
+      } else {
+        console.log(`📊 No users in room trip-${tripID}`);
+      }
+    } else {
+      console.log('❌ Socket.IO not available for real-time updates');
+    }
+
     // Return success response
-    const responseData = {
+    res.status(201).json({
       success: true,
-      message: "تم تأكيد الحجز بنجاح",
+      message: "تم تأكيد الحجز بنجاح!",
       data: {
         booking: {
-          _id: booking._id,
+          id: booking._id,
+          bookingNumber: booking.bookingNumber,
           status: booking.status,
           totalAmount: booking.totalAmount,
-          paymentStatus: booking.paymentStatus,
-          passengers: booking.passengers,
           assignedSeats: booking.assignedSeats,
-          createdAt: booking.createdAt
+          passengers: booking.passengers
+        },
+        trip: {
+          id: trip._id,
+          origin: trip.origin,
+          destination: trip.destination,
+          departureDate: trip.departureDate,
+          departureTime: trip.departureTime
         },
         creditCard: {
           balance: creditCard.balance,
-          last4: creditCard.cardNumberLast4,
-          brand: creditCard.brand,
-        },
-      },
-    };
+          last4: creditCard.cardNumberLast4
+        }
+      }
+    });
 
-    console.log('Booking successful:', JSON.stringify(responseData, null, 2));
-    res.status(201).json(responseData);
   } catch (error) {
-    console.error("Error booking trip:", error);
+    // Ensure session is aborted on any error
+    if (useTransactions && session && session.inTransaction()) {
+      await session.abortTransaction();
+    }
+    
+    console.error('Booking error:', error);
     res.status(500).json({
       success: false,
-      message: "فشل في معالجة الحجز",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+      message: "حدث خطأ أثناء معالجة الحجز. يرجى المحاولة مرة أخرى.",
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
+  } finally {
+    // Always end the session if it exists
+    if (session) {
+      session.endSession();
+    }
   }
 });
 
@@ -2150,10 +2317,19 @@ router.get("/trips/public", async (req, res) => {
     // Build trip query from filters
     const tripQuery = buildTripQuery(req.query);
 
-    // Get filtered trips
-    const trips = await Trip.find(tripQuery)
+    // Exclude trips that have already departed (date/time in the past)
+    const now = new Date();
+    const trips = (await Trip.find(tripQuery)
       .sort({ departureDate: 1, departureTime: 1 })
-      .lean();
+      .lean())
+      .filter(trip => {
+        // Combine departureDate and departureTime into a single Date object
+        if (!trip.departureDate || !trip.departureTime) return false;
+        const [hours, minutes] = trip.departureTime.split(':').map(Number);
+        const depDate = new Date(trip.departureDate);
+        depDate.setHours(hours || 0, minutes || 0, 0, 0);
+        return depDate >= now;
+      });
 
     // Get unique company IDs from the trips
     const companyIds = [...new Set(trips.map((trip) => trip.companyID))];
@@ -2268,8 +2444,13 @@ router.get("/trips/:tripId/available-seats",
  * @access  Private (User)
  */
 router.delete("/delete-credit-card/:cardId", auth, customerOnly, async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
+  // Only use transactions in production (requires replica set)
+  const useTransactions = process.env.NODE_ENV === 'production';
+  const session = useTransactions ? await mongoose.startSession() : null;
+  
+  if (useTransactions) {
+    session.startTransaction();
+  }
   
   try {
     const { cardId } = req.params;
@@ -2287,12 +2468,14 @@ router.delete("/delete-credit-card/:cardId", auth, customerOnly, async (req, res
     const card = await CreditCard.findOne({
       _id: cardId,
       user: userId,
-    }).session(session);
+    }).session(useTransactions ? session : null);
 
     if (!card) {
       console.log('Card not found or does not belong to user');
-      await session.abortTransaction();
-      session.endSession();
+      if (useTransactions) {
+        await session.abortTransaction();
+        session.endSession();
+      }
       return res.status(404).json({
         success: false,
         message: "Credit card not found or you don't have permission to delete it",
@@ -2305,35 +2488,44 @@ router.delete("/delete-credit-card/:cardId", auth, customerOnly, async (req, res
     const updateResult = await Customer.updateOne(
       { _id: userId },
       { $pull: { creditCards: cardId } },
-      { session }
+      { session: useTransactions ? session : undefined }
     );
     console.log('Update result:', updateResult);
 
     // If this was the default card, update the defaultPaymentMethod
     console.log('Checking if card was default payment method');
-    const customer = await Customer.findById(userId).session(session);
+    const customerQuery = Customer.findById(userId);
+    const customer = useTransactions 
+      ? await customerQuery.session(session)
+      : await customerQuery;
     console.log('Customer defaultPaymentMethod:', customer.defaultPaymentMethod);
     if (customer.defaultPaymentMethod?.toString() === cardId) {
       console.log('Card was default payment method, updating to null');
       customer.defaultPaymentMethod = null;
-      await customer.save({ session });
+      await customer.save({ session: useTransactions ? session : undefined });
     }
 
     // Delete the card
     console.log('Deleting credit card document');
-    const deleteResult = await CreditCard.deleteOne({ _id: cardId }).session(session);
+    const deleteResult = useTransactions
+      ? await CreditCard.deleteOne({ _id: cardId }).session(session)
+      : await CreditCard.deleteOne({ _id: cardId });
     console.log('Delete result:', deleteResult);
 
-    await session.commitTransaction();
-    session.endSession();
+    if (useTransactions) {
+      await session.commitTransaction();
+      session.endSession();
+    }
 
     res.status(200).json({
       success: true,
       message: "Credit card deleted successfully",
     });
   } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
+    if (useTransactions) {
+      await session.abortTransaction();
+      session.endSession();
+    }
     console.error("Error deleting credit card:", error);
     res.status(500).json({
       success: false,
@@ -2517,21 +2709,31 @@ router.get("/credit-cards/debug", auth, customerOnly, async (req, res) => {
  * @access  Private (User)
  */
 router.post("/credit-cards/fix", auth, customerOnly, async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
+  // Only use transactions in production (requires replica set)
+  const useTransactions = process.env.NODE_ENV === 'production';
+  const session = useTransactions ? await mongoose.startSession() : null;
+  
+  if (useTransactions) {
+    session.startTransaction();
+  }
 
   try {
     const userId = req.user._id || req.user.id;
     console.log("Fixing credit cards for user:", userId);
 
     // Get user with all credit cards
-    const user = await User.findById(userId)
+    const userQuery = User.findById(userId)
       .populate("creditCards")
-      .populate("defaultPaymentMethod")
-      .session(session);
+      .populate("defaultPaymentMethod");
+    
+    const user = useTransactions 
+      ? await userQuery.session(session)
+      : await userQuery;
 
     if (!user) {
-      await session.abortTransaction();
+      if (useTransactions) {
+        await session.abortTransaction();
+      }
       return res.status(404).json({
         success: false,
         message: "User not found",
@@ -2539,11 +2741,15 @@ router.post("/credit-cards/fix", auth, customerOnly, async (req, res) => {
     }
 
     // Get all credit cards
-    const allCards = await CreditCard.find({ user: userId }).session(session);
+    const allCards = useTransactions
+      ? await CreditCard.find({ user: userId }).session(session)
+      : await CreditCard.find({ user: userId });
     console.log("Found credit cards:", allCards.length);
 
     if (allCards.length === 0) {
-      await session.abortTransaction();
+      if (useTransactions) {
+        await session.abortTransaction();
+      }
       return res.status(404).json({
         success: false,
         message: "No credit cards found",
@@ -2556,22 +2762,24 @@ router.post("/credit-cards/fix", auth, customerOnly, async (req, res) => {
       console.log("No default card found, setting first card as default");
       defaultCard = allCards[0];
       defaultCard.isDefault = true;
-      await defaultCard.save({ session });
+      await defaultCard.save({ session: useTransactions ? session : undefined });
     }
 
     // Update user's default payment method
     user.defaultPaymentMethod = defaultCard._id;
-    await user.save({ session });
+    await user.save({ session: useTransactions ? session : undefined });
 
     // Update all cards' isDefault status
     await CreditCard.updateMany(
       { user: userId, _id: { $ne: defaultCard._id } },
       { $set: { isDefault: false } },
-      { session }
+      { session: useTransactions ? session : undefined }
     );
 
-    // Commit the transaction
-    await session.commitTransaction();
+    // Commit the transaction only if using transactions
+    if (useTransactions) {
+      await session.commitTransaction();
+    }
 
     // Get updated card data
     const updatedCards = await CreditCard.find({ user: userId })
@@ -2588,7 +2796,9 @@ router.post("/credit-cards/fix", auth, customerOnly, async (req, res) => {
       },
     });
   } catch (error) {
-    await session.abortTransaction();
+    if (useTransactions) {
+      await session.abortTransaction();
+    }
     console.error("Error fixing credit cards:", error);
     res.status(500).json({
       success: false,
@@ -2596,7 +2806,9 @@ router.post("/credit-cards/fix", auth, customerOnly, async (req, res) => {
       error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   } finally {
-    session.endSession();
+    if (session) {
+      session.endSession();
+    }
   }
 });
 
@@ -2621,6 +2833,91 @@ router.get("/companies/active", async (req, res) => {
       message: "Failed to fetch companies",
       error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
+  }
+});
+
+/**
+ * @route   GET /api/user/booking/:id/qrcode
+ * @desc    Generate a QR code (data URL) for a booking
+ * @access  Public
+ */
+router.get('/booking/:id/qrcode', async (req, res) => {
+  try {
+    const bookingId = req.params.id;
+
+    // Find the booking
+    const booking = await Booking.findById(bookingId);
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found',
+      });
+    }
+
+    // The URL to encode in the QR code (customize as needed)
+    const bookingUrl = `http://172.20.10.3:3000/booking/${bookingId}`;
+
+    // Generate QR code as data URL
+    const qrCodeDataUrl = await QRCode.toDataURL(bookingUrl, { errorCorrectionLevel: 'H' });
+
+    res.status(200).json({
+      success: true,
+      qrCodeDataUrl,
+      bookingUrl,
+    });
+  } catch (error) {
+    console.error('Error generating QR code:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate QR code',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined,
+    });
+  }
+});
+
+/**
+ * @route   GET /api/public/booking/:id
+ * @desc    Public: Get booking details by ID (no authentication)
+ * @access  Public
+ */
+router.get('/public/booking/:id', async (req, res) => {
+  try {
+    const bookingId = req.params.id;
+    // Find the booking by ID
+    const booking = await Booking.findById(bookingId).lean();
+    if (!booking) {
+      return res.status(404).json({ success: false, message: 'Booking not found' });
+    }
+    // Populate trip and company info
+    const trip = await mongoose.model('Trip').findById(booking.tripID).lean();
+    let company = null;
+    if (trip && trip.companyID) {
+      company = await mongoose.model('Company').findOne({ companyID: trip.companyID }).lean();
+    }
+    // Format response (only non-sensitive info)
+    res.status(200).json({
+      success: true,
+      data: {
+        trip: trip ? {
+          origin: trip.origin,
+          destination: trip.destination,
+          departureDate: trip.departureDate,
+          departureTime: trip.departureTime,
+          company: company ? { name: company.companyName, logo: company.logo } : null,
+          cost: trip.cost,
+        } : null,
+        passengers: booking.passengers?.map(p => ({
+          firstName: p.firstName,
+          lastName: p.lastName,
+          seatNumber: p.seatNumber,
+        })),
+        totalAmount: booking.totalAmount,
+        paymentStatus: booking.paymentStatus,
+        status: booking.status,
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Error fetching booking', error: error.message });
   }
 });
 

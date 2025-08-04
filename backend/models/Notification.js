@@ -6,7 +6,6 @@ const notificationSchema = new mongoose.Schema(
     // Customer's email who should receive the notification
     userEmail: {
       type: String,
-      required: true,
       index: true,
       trim: true,
       lowercase: true,
@@ -27,7 +26,14 @@ const notificationSchema = new mongoose.Schema(
     // Type of notification (for styling/filtering)
     type: {
       type: String,
-      enum: ["trip_cancellation", "booking_confirmation", "payment", "system"],
+      enum: [
+        "trip_cancellation",
+        "booking_confirmation",
+        "payment",
+        "system",
+        "info",
+        "update",
+      ],
       default: "system",
     },
 

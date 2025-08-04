@@ -54,6 +54,15 @@ router.post('/login', async (req, res) => {
       userType = 'Staff';
       
       if (user) {
+        // DEBUG: Log user details
+        console.log('DEBUG: Found staff user:', {
+          username: user.username,
+          staffType: user.staffType,
+          hasPassword: !!user.password,
+          passwordLength: user.password ? user.password.length : 0,
+          passwordStart: user.password ? user.password.substring(0, 10) + '...' : 'none'
+        });
+        
         // Check company status for staff
         const company = await Company.findOne({ companyID: user.companyID });
         if (!company) {
@@ -76,6 +85,14 @@ router.post('/login', async (req, res) => {
 
     // Compare passwords (assuming you have a method like user.comparePassword)
     console.log('Comparing passwords for user:', user.username);
+    console.log('DEBUG: Input password:', password);
+    console.log('DEBUG: Stored password hash:', user.password);
+    
+    // Test direct bcrypt comparison
+    const bcrypt = require('bcrypt');
+    const directMatch = await bcrypt.compare(password, user.password);
+    console.log('DEBUG: Direct bcrypt comparison result:', directMatch);
+    
     const isMatch = await user.comparePassword(password);
     console.log('Password match result:', isMatch);
     
@@ -85,14 +102,19 @@ router.post('/login', async (req, res) => {
 
     // Create token with user data
     console.log('Creating JWT token for user:', user._id);
-    const token = jwt.sign({ 
+    // Add companyID to token payload for Company and Staff
+    let tokenPayload = { 
       id: user._id,
       username: user.username,
       userType: userType,
       email: user.email,
       role: user.role,
       type: 'access'  // Add this line to specify token type
-    }, process.env.JWT_SECRET, {
+    };
+    if ((userType === 'Company' || userType === 'Staff') && user.companyID) {
+      tokenPayload.companyID = user.companyID;
+    }
+    const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, {
       expiresIn: '1h'
     });
 
@@ -107,10 +129,16 @@ router.post('/login', async (req, res) => {
     });
     console.log('Token created:', tokenDoc._id);
 
+    // Add companyID to user object in response for Company and Staff
+    let userResponse = user.toObject();
+    if ((userType === 'Company' || userType === 'Staff') && user.companyID) {
+      userResponse.companyID = user.companyID;
+    }
+
     res.json({ 
       token,
       userType,
-      user: user.toObject(),
+      user: userResponse,
       dashboardPath: getDashboardPath(userType)
     });
 
@@ -151,7 +179,7 @@ router.post('/logout', async (req, res) => {
 function getDashboardPath(userType) {
   switch(userType) {
     case 'Admin': return '/admin/dashboard';
-    case 'Company': return '/company/dashboard';
+    case 'Company': return '/manager/dashboard';
     case 'Staff': return '/staff/dashboard';
     default: return '/login';
   }
@@ -160,10 +188,14 @@ function getDashboardPath(userType) {
 // Get all buses for company with driver info if available
 router.get('/show-buses', auth, managerOrStaff, async (req, res) => {
   try {
-    const buses = await Bus.find({ companyID: req.user.companyID })
+    // This logic handles both manager (using _id) and staff (using companyID)
+    const companyId = req.user.companyID;
+    const query = { company: companyId };
+
+    const buses = await Bus.find(query)
       .populate({
         path: 'driver',
-        select: 'username phone staffType',
+        select: 'username phone staffType status',
         match: { staffType: 'driver' }
       })
       .lean();
@@ -181,6 +213,13 @@ router.get('/show-buses', auth, managerOrStaff, async (req, res) => {
       // Remove the _id field from the driver object if it exists
       if (busObj.driver && busObj.driver._id) {
         delete busObj.driver._id;
+      }
+      
+      // Add a check for userType and adjust the logic for creating the trip
+      if (req.user.userType === 'Staff') {
+        // Logic specific to staff
+      } else {
+        // Logic for manager
       }
       
       return busObj;
@@ -241,13 +280,12 @@ router.post('/add-trip', auth, managerOrStaff, async (req, res, next) => {
       });
     }
 
-    // Company details are already attached by companyUserMiddleware
-    const company = req.company;
+    // Find company details from the user's token
+    const company = await Company.findOne({ companyID: req.user.companyID });
     if (!company) {
       return res.status(404).json({
         success: false,
-        message: 'Company not found',
-        field: 'companyId'
+        message: 'Company associated with your account not found.'
       });
     }
 
@@ -262,19 +300,39 @@ router.post('/add-trip', auth, managerOrStaff, async (req, res, next) => {
     }
 
     // Verify bus belongs to company
-    if (bus.companyID !== company.companyID) {
+    if (bus.company !== company.companyID) {
       return res.status(403).json({
         success: false,
         message: 'Bus does not belong to your company'
       });
     }
 
+    // Check for trip conflicts before creating a new one
+    const newDeparture = new Date(departureDate);
+    const newArrival = new Date(arrivalDate);
 
+    const existingTrip = await Trip.findOne({
+      bus: bus._id,
+      status: { $nin: ['cancelled', 'completed'] },
+      // Check for overlapping time ranges:
+      // An existing trip starts before the new one ends, AND
+      // an existing trip ends after the new one starts.
+      departureDate: { $lt: newArrival },
+      arrivalDate: { $gt: newDeparture }
+    });
+
+    if (existingTrip) {
+      return res.status(400).json({
+        success: false,
+        message: 'الباص محدد لرحلة في هذا التوقيت.',
+        type: 'BUSY_BUS'
+      });
+    }
 
     // Log user information for debugging
     console.log('User creating trip:', {
       userId: req.user._id || req.user.id,
-      userType: req.user.userType,
+      userType: req.user.role,
       role: req.user.role,
       companyID: company.companyID
     });
@@ -356,20 +414,28 @@ router.put('/Edit-trip/:id', auth, managerOrStaff, async (req, res) => {
       status
     } = req.body;
 
+    console.log('Edit trip request:', { id, busNumber, origin, destination, departureDate, arrivalDate, cost, status });
+    console.log('User companyID:', req.user.companyID);
+
     // Find the trip and verify ownership
     const trip = await Trip.findOne({ _id: id, companyID: req.user.companyID });
     if (!trip) {
+      console.log('Trip not found or access denied');
       return res.status(404).json({
         success: false,
         message: 'Trip not found or you do not have permission to edit this trip'
       });
     }
 
+    console.log('Found trip:', trip);
+
     // Get the bus details if busNumber is being updated
     let bus;
     if (busNumber && busNumber !== trip.busNumber) {
+      console.log('Looking for bus with number:', busNumber, 'in company:', req.user.companyID);
       bus = await Bus.findOne({ busNumber, companyID: req.user.companyID });
       if (!bus) {
+        console.log('Bus not found');
         return res.status(400).json({
           success: false,
           message: 'Bus not found in your company',
@@ -377,9 +443,11 @@ router.put('/Edit-trip/:id', auth, managerOrStaff, async (req, res) => {
         });
       }
       req.body.bus = bus._id; // Set the bus reference
+      console.log('Found bus:', bus._id);
     } else {
       // If busNumber isn't being changed, use the existing bus
       bus = await Bus.findById(trip.bus);
+      console.log('Using existing bus:', bus);
     }
 
     // Check for trip conflicts if bus, date, or time is being modified
@@ -455,6 +523,13 @@ router.put('/Edit-trip/:id', auth, managerOrStaff, async (req, res) => {
         message: 'Failed to update trip. Please try again.'
       });
     }
+    
+    // Default error response
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to update trip. Please try again.',
+      error: error.message
+    });
   }
 });
 

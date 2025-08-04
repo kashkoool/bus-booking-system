@@ -191,6 +191,7 @@ const verifyAccessToken = async (tokenString) => {
     // Ensure user data is properly structured
     const userData = {
       id: tokenDoc.userId,
+      userType: tokenDoc.userType, // Include userType from tokenDoc
       ...tokenDoc.userData,
     };
 
@@ -213,7 +214,10 @@ const verifyAccessToken = async (tokenString) => {
 
     return {
       valid: true,
-      user: tokenDoc.userData,
+      user: {
+        ...tokenDoc.userData,
+        userType: tokenDoc.userType // Ensure userType is included in the user object
+      },
       token: tokenString,
       fromCache: false,
     };

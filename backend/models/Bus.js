@@ -6,6 +6,11 @@ const busSchema = new mongoose.Schema({
     type: Number,
     ref: 'Company',
     field: 'companyID',
+    required: false
+  },
+  company: {
+    type: Number,
+    ref: 'Company',
     required: true
   },
   addedBy: {
