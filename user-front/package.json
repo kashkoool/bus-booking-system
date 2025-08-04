@@ -1,0 +1,77 @@
+{
+  "name": "user-front",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@heroicons/react": "^2.0.18",
+    "@testing-library/jest-dom": "^5.17.0",
+    "@testing-library/react": "^13.4.0",
+    "@testing-library/user-event": "^13.5.0",
+    "assert": "^2.1.0",
+    "axios": "^1.6.2",
+    "buffer": "^6.0.3",
+    "chart.js": "^4.4.3",
+    "constants-browserify": "^1.0.0",
+    "core-js": "^3.36.0",
+    "crypto-browserify": "^3.12.0",
+    "framer-motion": "^12.18.1",
+    "https-browserify": "^1.0.0",
+    "jwt-decode": "^4.0.0",
+    "os-browserify": "^0.3.0",
+    "path-browserify": "^1.0.1",
+    "pdfkit": "^0.17.1",
+    "process": "^0.11.10",
+    "querystring-es3": "^0.2.1",
+    "react": "^18.2.0",
+    "react-chartjs-2": "^5.2.0",
+    "react-dom": "^18.3.1",
+    "react-icons": "^5.5.0",
+    "react-router-dom": "^6.24.0",
+    "react-scripts": "5.0.1",
+    "react-toastify": "^10.0.5",
+    "socket.io-client": "^4.8.1",
+    "stream-browserify": "^3.0.0",
+    "stream-http": "^3.2.0",
+    "url": "^0.11.3",
+    "user-front": "file:",
+    "util": "^0.12.5",
+    "web-vitals": "^2.1.4"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.4.16",
+    "browserify-zlib": "^0.2.0",
+    "compression-webpack-plugin": "^10.0.0",
+    "globalthis": "^1.0.4",
+    "postcss": "^8.4.31",
+    "react-app-rewired": "^2.2.1",
+    "tailwindcss": "^3.3.5",
+    "terser-webpack-plugin": "^5.3.9",
+    "url-loader": "^4.1.1",
+    "webpack-bundle-analyzer": "^4.10.1"
+  },
+  "scripts": {
+    "start": "react-app-rewired start",
+    "build": "react-app-rewired build",
+    "test": "react-app-rewired test",
+    "analyze": "npm run build && npx webpack-bundle-analyzer build/static/js/*.js",
+    "build:prod": "GENERATE_SOURCEMAP=false npm run build"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}
