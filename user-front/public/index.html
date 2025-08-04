@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="Bus Booking System - Book your bus tickets online with ease and convenience"
+    />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
+    
+    <!-- Preload critical resources -->
+    <link rel="preload" href="%PUBLIC_URL%/logo.png" as="image" type="image/png">
+    <link rel="preload" href="%PUBLIC_URL%/images/Icon.png" as="image" type="image/png">
+    
+    <!-- Preconnect to external domains -->
+    <link rel="preconnect" href="https://unpkg.com">
+    <link rel="dns-prefetch" href="https://unpkg.com">
+    
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    
+    <!-- Defer non-critical script -->
+    <script defer src="https://unpkg.com/ml5@0.12.2/dist/ml5.min.js"></script>
+    
+    <title>Bus Booking System</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    
+    <!-- Service Worker Registration -->
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js')
+            .then((registration) => {
+              console.log('SW registered: ', registration);
+            })
+            .catch((registrationError) => {
+              console.log('SW registration failed: ', registrationError);
+            });
+        });
+      }
+    </script>
+  </body>
+</html>
