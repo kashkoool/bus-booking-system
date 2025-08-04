@@ -36,12 +36,20 @@ jobs:
     - name: Install Backend Dependencies
       run: |
         cd backend
-        npm ci
+        if [ -f package-lock.json ]; then
+          npm ci
+        else
+          npm install
+        fi
 
     - name: Install Frontend Dependencies
       run: |
         cd user-front
-        npm ci
+        if [ -f package-lock.json ]; then
+          npm ci
+        else
+          npm install
+        fi
 
     - name: Check Backend Package.json
       run: |
@@ -107,12 +115,20 @@ jobs:
     - name: Install Backend Dependencies
       run: |
         cd backend
-        npm ci
+        if [ -f package-lock.json ]; then
+          npm ci
+        else
+          npm install
+        fi
 
     - name: Install Frontend Dependencies
       run: |
         cd user-front
-        npm ci
+        if [ -f package-lock.json ]; then
+          npm ci
+        else
+          npm install
+        fi
 
     - name: Check for Lint Scripts
       run: |
@@ -135,12 +151,20 @@ jobs:
     - name: Install Backend Dependencies
       run: |
         cd backend
-        npm ci
+        if [ -f package-lock.json ]; then
+          npm ci
+        else
+          npm install
+        fi
 
     - name: Install Frontend Dependencies
       run: |
         cd user-front
-        npm ci
+        if [ -f package-lock.json ]; then
+          npm ci
+        else
+          npm install
+        fi
 
     - name: Run Security Audit
       run: |
