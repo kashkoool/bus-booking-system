@@ -321,8 +321,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 If you have any questions or need help:
 
 - 📧 Email: loaekashkoool@gmail.com
-- 🐛 Issues: [GitHub Issues](https://github.com/yourusername/bus-booking-system/issues)
-- 📖 Documentation: [Wiki](https://github.com/yourusername/bus-booking-system/wiki)
+- 🐛 Issues: [GitHub Issues](https://github.com/kashkooo/bus-booking-system/issues)
+- 📖 Documentation: [Wiki](https://github.com/kashkooo/bus-booking-system/wiki)
 
 ## ⭐ Star History
 
